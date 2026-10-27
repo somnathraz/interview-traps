@@ -1,0 +1,386 @@
+{
+  "schemaVersion": 1,
+  "slug": "booking-race-condition",
+  "number": 1,
+  "title": "The double-booked seat",
+  "question": "Two users hit 'Book' on the last seat at the same moment. Your code checks availability first. Who gets the seat?",
+  "why": "Both requests read 'available' before either one writes. The check and the write are separate statements, so the gap between them is a window anyone can walk through.",
+  "rule": "Never check-then-act across two statements. Make the check part of the write (UPDATE … WHERE status = 'available'), and back it with a UNIQUE constraint.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/01-booking-race-condition",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    },
+    {
+      "id": "payments",
+      "label": "Payment API",
+      "kind": "external"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Check, then act",
+      "source": "import type { Ctx } from \"../shared/ctx.ts\";\n\n/**\n * BUG: check-then-act.\n * The SELECT and the UPDATE are two separate moments in time.\n * Anyone who reads in between sees \"available\" too.\n */\nexport async function bookSeat(ctx: Ctx, seatId: string, userId: string) {\n  // step: read\n  const { rows } = await ctx.db.query(\n    \"SELECT status FROM seats WHERE id = $1\",\n    [seatId],\n  );\n\n  // step: check\n  if (rows[0].status !== \"available\") {\n    return ctx.respond(\"SOLD_OUT\");\n  }\n\n  // step: pay\n  await ctx.chargePayment(userId); // the gap where everyone else sneaks in\n\n  // step: write\n  await ctx.db.query(\n    \"UPDATE seats SET status = 'booked', booked_by = $2 WHERE id = $1\",\n    [seatId, userId],\n  );\n  await ctx.db.query(\n    \"INSERT INTO bookings (seat_id, user_id) VALUES ($1, $2)\",\n    [seatId, userId],\n  );\n\n  // step: respond\n  return ctx.respond(\"CONFIRMED\");\n}\n",
+      "steps": {
+        "read": [
+          9,
+          13
+        ],
+        "check": [
+          15,
+          18
+        ],
+        "pay": [
+          20,
+          21
+        ],
+        "write": [
+          23,
+          31
+        ],
+        "respond": [
+          33,
+          34
+        ]
+      },
+      "initialState": {
+        "seats": [
+          {
+            "id": "A1",
+            "status": "available",
+            "booked_by": null
+          }
+        ],
+        "bookings": []
+      },
+      "events": [
+        {
+          "t": 4.7,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /book { seat: \"A1\" }"
+        },
+        {
+          "t": 4.7,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /book { seat: \"A1\" }"
+        },
+        {
+          "t": 6.4,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT seats → status = 'available'",
+          "detail": "SELECT status FROM seats WHERE id = $1",
+          "step": "read"
+        },
+        {
+          "t": 6.5,
+          "actor": "alice",
+          "target": "payments",
+          "type": "wait",
+          "label": "charging alice… (80ms)",
+          "detail": "Simulated payment API call. In production this is a network hop to Razorpay/Stripe, often 100ms+.",
+          "step": "pay"
+        },
+        {
+          "t": 6.7,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT seats → status = 'available'",
+          "detail": "SELECT status FROM seats WHERE id = $1",
+          "step": "read"
+        },
+        {
+          "t": 6.8,
+          "actor": "bob",
+          "target": "payments",
+          "type": "wait",
+          "label": "charging bob… (80ms)",
+          "detail": "Simulated payment API call. In production this is a network hop to Razorpay/Stripe, often 100ms+.",
+          "step": "pay"
+        },
+        {
+          "t": 87.9,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE seats → 1 row changed",
+          "detail": "UPDATE seats SET status = 'booked', booked_by = $2 WHERE id = $1",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": []
+          },
+          "step": "write"
+        },
+        {
+          "t": 88.2,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE seats → 1 row changed",
+          "detail": "UPDATE seats SET status = 'booked', booked_by = $2 WHERE id = $1",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": []
+          },
+          "step": "write"
+        },
+        {
+          "t": 90.9,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT bookings → 1 row changed",
+          "detail": "INSERT INTO bookings (seat_id, user_id) VALUES ($1, $2)",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": [
+              {
+                "id": 1,
+                "seat_id": "A1",
+                "user_id": "alice"
+              },
+              {
+                "id": 2,
+                "seat_id": "A1",
+                "user_id": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 91.3,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT bookings → 1 row changed",
+          "detail": "INSERT INTO bookings (seat_id, user_id) VALUES ($1, $2)",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": [
+              {
+                "id": 1,
+                "seat_id": "A1",
+                "user_id": "alice"
+              },
+              {
+                "id": 2,
+                "seat_id": "A1",
+                "user_id": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 91.5,
+          "actor": "alice",
+          "type": "response",
+          "label": "CONFIRMED",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 91.8,
+          "actor": "bob",
+          "type": "response",
+          "label": "CONFIRMED",
+          "severity": "bad",
+          "step": "respond",
+          "detail": "A second success for something only one user can have. This is the bug."
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Seat A1 sold 2 times. 2 users were told CONFIRMED."
+      }
+    },
+    "fix": {
+      "label": "Atomic conditional UPDATE",
+      "source": "import type { Ctx } from \"../shared/ctx.ts\";\n\n/**\n * FIX: make the check and the claim ONE atomic statement.\n * Postgres row-locks the seat during the UPDATE, so only one\n * request can flip 'available' -> 'booked'. Everyone else gets 0 rows.\n */\nexport async function bookSeat(ctx: Ctx, seatId: string, userId: string) {\n  // step: claim\n  const claimed = await ctx.db.query(\n    `UPDATE seats SET status = 'booked', booked_by = $2\n     WHERE id = $1 AND status = 'available'\n     RETURNING id`,\n    [seatId, userId],\n  );\n\n  // step: check\n  if (claimed.rowCount === 0) {\n    return ctx.respond(\"SOLD_OUT\");\n  }\n\n  // step: pay\n  await ctx.chargePayment(userId); // safe now: the seat is already ours\n\n  // step: write\n  await ctx.db.query(\n    \"INSERT INTO bookings (seat_id, user_id) VALUES ($1, $2)\",\n    [seatId, userId],\n  );\n\n  // step: respond\n  return ctx.respond(\"CONFIRMED\");\n}\n",
+      "steps": {
+        "claim": [
+          9,
+          15
+        ],
+        "check": [
+          17,
+          20
+        ],
+        "pay": [
+          22,
+          23
+        ],
+        "write": [
+          25,
+          29
+        ],
+        "respond": [
+          31,
+          32
+        ]
+      },
+      "initialState": {
+        "seats": [
+          {
+            "id": "A1",
+            "status": "available",
+            "booked_by": null
+          }
+        ],
+        "bookings": []
+      },
+      "events": [
+        {
+          "t": 3.6,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /book { seat: \"A1\" }"
+        },
+        {
+          "t": 3.6,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /book { seat: \"A1\" }"
+        },
+        {
+          "t": 4.6,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE seats → 1 row changed",
+          "detail": "UPDATE seats SET status = 'booked', booked_by = $2 WHERE id = $1 AND status = 'available' RETURNING id",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 4.8,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE seats → 0 rows changed",
+          "detail": "UPDATE seats SET status = 'booked', booked_by = $2 WHERE id = $1 AND status = 'available' RETURNING id",
+          "severity": "warn",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 5.2,
+          "actor": "bob",
+          "target": "payments",
+          "type": "wait",
+          "label": "charging bob… (80ms)",
+          "detail": "Simulated payment API call. In production this is a network hop to Razorpay/Stripe, often 100ms+.",
+          "step": "pay"
+        },
+        {
+          "t": 5.3,
+          "actor": "alice",
+          "type": "response",
+          "label": "SOLD_OUT",
+          "severity": "warn",
+          "step": "check"
+        },
+        {
+          "t": 86.7,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT bookings → 1 row changed",
+          "detail": "INSERT INTO bookings (seat_id, user_id) VALUES ($1, $2)",
+          "state": {
+            "seats": [
+              {
+                "id": "A1",
+                "status": "booked",
+                "booked_by": "bob"
+              }
+            ],
+            "bookings": [
+              {
+                "id": 1,
+                "seat_id": "A1",
+                "user_id": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 87.1,
+          "actor": "bob",
+          "type": "response",
+          "label": "CONFIRMED",
+          "severity": "ok",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "Seat A1 sold exactly once. 1 user(s) got SOLD_OUT."
+      }
+    }
+  },
+  "generatedAt": "2026-10-27T15:17:48.673Z"
+}

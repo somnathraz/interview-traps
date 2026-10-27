@@ -1,0 +1,30 @@
+{
+  "name": "interview-traps",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend interview traps you can run: the bug, the fix, and a test that proves it.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Somanath Khadanga (https://somanathkhadanga.com)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "01:bug": "tsx 01-booking-race-condition/run.ts bug",
+    "01:fix": "tsx 01-booking-race-condition/run.ts fix",
+    "trace": "tsx shared/build-traces.ts",
+    "test": "tsx --test \"*/proof.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
