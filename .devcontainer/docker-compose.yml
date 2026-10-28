@@ -1,0 +1,23 @@
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/interview-traps:cached
+    environment:
+      DATABASE_URL: postgres://traps:traps@postgres:5432/traps
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: traps
+      POSTGRES_PASSWORD: traps
+      POSTGRES_DB: traps
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traps"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

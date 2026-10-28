@@ -1,0 +1,15 @@
+{
+  "name": "interview-traps",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/interview-traps",
+  "postCreateCommand": "npm ci",
+  "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "01-booking-race-condition/challenge.ts",
+        "01-booking-race-condition/README.md"
+      ]
+    }
+  }
+}

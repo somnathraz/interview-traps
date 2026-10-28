@@ -16,3 +16,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: challenge runner accepts the reference fix
+        run: CHALLENGE_SOLUTION=1 npm run 01:challenge
+      - name: challenge starts unsolved
+        run: '! npm run 01:challenge'

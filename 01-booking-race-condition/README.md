@@ -19,6 +19,17 @@ npm run 01:bug -- --users 200
 ✅ Seat A1 sold exactly once. 49 user(s) got SOLD_OUT.
 ```
 
+## Your turn
+
+`challenge.ts` is the buggy code. Fix it, then run:
+
+```bash
+npm run 01:challenge             # 50 users, 3 rounds, real Postgres
+npm run 01:challenge -- --hint   # a nudge (--hint 2, --hint 3 for more)
+```
+
+Or open the repo in Codespaces and it is all set up. The answer is below and in `fix.ts`.
+
 ## The bug: check, then act ([`bug.ts`](./bug.ts))
 
 ```ts

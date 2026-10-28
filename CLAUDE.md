@@ -12,6 +12,7 @@ Folder `NN-slug/` with exactly: `bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts
 - `episode.ts` exports `episode: Episode` (see `shared/episode.ts`). `traceUsers` = 2-3 short names.
 - `proof.test.ts` must FAIL if the bug stops reproducing and FAIL if the fix breaks. Use ≥50 concurrent users and `warmPool` (cold pools hide races).
 - Add `NN:bug` / `NN:fix` scripts to package.json and a row to the root README table.
+- Optional challenge mode: `challenge.ts` (starts as the bug, same signature, header comment with the rules) and `run-challenge.ts` (checks it with >=50 concurrent users over several rounds; `CHALLENGE_SOLUTION=1` runs `fix.ts` through the same checks). Add an `NN:challenge` script. Do NOT name it `*.test.ts`: it fails by design and would break `npm test`. See `01-booking-race-condition/run-challenge.ts`.
 
 ## Systems (grouped weekly traps)
 

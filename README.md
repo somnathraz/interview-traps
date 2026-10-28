@@ -12,11 +12,24 @@ $ npm run 01:fix
 ✅ Seat A1 sold exactly once. 49 user(s) got SOLD_OUT.
 ```
 
+## Try to fix it yourself
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/somnathraz/interview-traps)
+
+Each trap can ship with a **challenge**: the buggy code in `challenge.ts`, and a checker that throws 50 concurrent users at a real Postgres. Edit the code until it passes.
+
+```bash
+npm run 01:challenge             # checks your fix
+npm run 01:challenge -- --hint   # stuck? get a nudge
+```
+
+Codespaces gives you the repo and a Postgres, ready to run. Nothing to install. The answer is in `fix.ts`: no peeking until you pass.
+
 ## Episodes
 
 | # | Trap | Run | Replay |
 |---|---|---|---|
-| 01 | [The double-booked seat](./01-booking-race-condition) · check-then-act race | `npm run 01:bug` | [▶ watch](https://somanathkhadanga.com/labs/traps/booking-race-condition) |
+| 01 | [The double-booked seat](./01-booking-race-condition) · check-then-act race | `npm run 01:bug` · challenge `npm run 01:challenge` | [▶ watch](https://somanathkhadanga.com/labs/traps/booking-race-condition) |
 | 02 | Offset pagination skips & duplicates rows | coming | |
 | 03 | Cache stampede when a hot key expires | coming | |
 | 04 | Payment retries without idempotency keys | coming | |
@@ -44,7 +57,7 @@ npm test             # every episode's proof
 npm run 01:bug
 ```
 
-Already have Postgres? Skip Docker and set `DATABASE_URL` (default `postgres://traps:traps@localhost:5432/traps`).
+Already have Postgres? Skip Docker and set `DATABASE_URL` (default `postgres://traps:traps@localhost:5432/traps`). If something else already uses port 5432, run this repo's Postgres on another port and set `DATABASE_URL` to match, or the code will quietly connect to the wrong database.
 
 ## How every episode is built
 
