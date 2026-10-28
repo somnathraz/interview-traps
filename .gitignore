@@ -2,3 +2,7 @@ node_modules
 .env
 *.log
 .DS_Store
+
+# local agent/planning files
+.claude/
+HANDOFF.md

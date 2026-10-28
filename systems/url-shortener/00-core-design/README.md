@@ -27,6 +27,11 @@ No collision possible — every ID is issued once. Trade-off introduced here and
 
 Redirects outnumber creates by roughly 100:1. The design should optimize for reads (caching, CDN) more than writes.
 
+## Watch
+
+- Read it on the site: [somanathkhadanga.com/labs/traps/url-shortener-core-design](https://somanathkhadanga.com/labs/traps/url-shortener-core-design)
+- Short reel: [YouTube](https://youtube.com/shorts/IXoW0dAlyV0) · [Instagram](https://www.instagram.com/codewithsom/reel/DfCJSCah3me/)
+
 ## Interview rule
 
 The signal isn't the code — it's naming the trade-off out loud. Hash avoids a central bottleneck but needs collision handling; counter avoids collisions but needs to scale the ID generator itself.
@@ -37,5 +42,3 @@ The signal isn't the code — it's naming the trade-off out loud. Hash avoids a 
 - Day 3: the redirect cache from the read-heavy design, serving stale destinations.
 - Day 4-6: analytics write contention, vanity alias races, cleanup at scale.
 - Day 7: all of the above, rolled into one post.
-
-Reel script: `~/code/AgentBuilder/ytPipeline/mythology-factory/data/episodes-tech/1793168104878-url-shortener-day1-core-design.json`

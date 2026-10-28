@@ -8,7 +8,7 @@ Each day still gets a reel. The code traps here follow the same contract as the 
 
 | Day | Topic | Trap | Status |
 |---|---|---|---|
-| Mon | Core design | Hash vs counter+base62 — the decision, not a bug | [design notes](./00-core-design/README.md) |
+| Mon | Core design | Hash vs counter+base62 — the decision, not a bug | [design notes](./00-core-design/README.md) · [read on site](https://somanathkhadanga.com/labs/traps/url-shortener-core-design) |
 | Tue | ID collision | Counter-based ID generator under concurrency | coming |
 | Wed | Cache invalidation | Redirect cached, destination updated, stale link served | coming |
 | Thu | Hot-path write | Click-analytics write blocking the redirect | coming |
