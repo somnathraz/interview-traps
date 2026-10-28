@@ -13,6 +13,12 @@ Folder `NN-slug/` with exactly: `bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts
 - `proof.test.ts` must FAIL if the bug stops reproducing and FAIL if the fix breaks. Use ≥50 concurrent users and `warmPool` (cold pools hide races).
 - Add `NN:bug` / `NN:fix` scripts to package.json and a row to the root README table.
 
+## Systems (grouped weekly traps)
+
+A "system" is a themed week (e.g. URL Shortener): one design episode plus several real bugs in that system, rolled into one blog post at the end. Lives in `systems/<system-slug>/`, independent of the flat `NN-slug/` episodes above — the flat list stays generic backend traps unrelated to any one system; do not move them into a system folder.
+
+Folder: `systems/<system-slug>/README.md` (week plan, table of days) + one folder per day. Day 1 (the design episode) has no bug/fix — just `README.md`. Each bug day follows the same contract as a numbered episode (`bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts`, `README.md`, `trace.json`), just nested under the system folder instead of at root. npm scripts for a system use the system name as prefix (e.g. `shortener:bug`, `shortener:fix`), added to package.json as each day's trap ships — don't add placeholder scripts for traps that don't exist yet, and don't create a trap folder's code files until that day's episode is actually written (an incomplete `proof.test.ts` breaks `npm test`'s glob).
+
 ## Commands
 
 - `npm run db:up` (Docker) or set `DATABASE_URL`

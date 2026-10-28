@@ -23,6 +23,16 @@ $ npm run 01:fix
 
 New episodes land with each reel on Instagram/YouTube.
 
+## Systems (weekly deep dives)
+
+Instead of one isolated trap, a system gets a full week: the design decision on day one, then a different real bug each day, rolled into one write-up on the last day.
+
+| System | Days | Status |
+|---|---|---|
+| [URL Shortener](./systems/url-shortener) | Core design → ID collision → cache invalidation → hot-path write → vanity alias race → cleanup at scale → rollup | in progress |
+
+See [`systems/url-shortener/README.md`](./systems/url-shortener/README.md) for this week's plan. Systems live in `systems/<name>/`, independent of the numbered episodes above.
+
 ## Quick start
 
 ```bash
