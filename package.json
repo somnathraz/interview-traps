@@ -14,6 +14,7 @@
     "db:down": "docker compose down",
     "01:bug": "tsx 01-booking-race-condition/run.ts bug",
     "01:fix": "tsx 01-booking-race-condition/run.ts fix",
+    "01:challenge": "tsx 01-booking-race-condition/run-challenge.ts",
     "trace": "tsx shared/build-traces.ts",
     "test": "tsx --test \"*/proof.test.ts\"",
     "typecheck": "tsc --noEmit"
