@@ -29,7 +29,7 @@ Instead of one isolated trap, a system gets a full week: the design decision on 
 
 | System | Days | Status |
 |---|---|---|
-| [URL Shortener](./systems/url-shortener) | Core design → ID collision → cache invalidation → hot-path write → vanity alias race → cleanup at scale → rollup | in progress |
+| [URL Shortener](./systems/url-shortener) | Core design → [ID collision](./systems/url-shortener/01-id-collision) → [stale redirect](./systems/url-shortener/02-stale-redirect) → [analytics on the hot path](./systems/url-shortener/03-click-counter) → vanity alias race → cleanup at scale → rollup | 4 of 7 days live · `npm run shortener:bug -- id-collision` |
 
 See [`systems/url-shortener/README.md`](./systems/url-shortener/README.md) for this week's plan. Systems live in `systems/<name>/`, independent of the numbered episodes above.
 
@@ -40,7 +40,7 @@ git clone https://github.com/somnathraz/interview-traps
 cd interview-traps
 npm install
 npm run db:up        # Postgres 16 + Redis 7 via Docker
-npm test             # every episode's proof
+npm test             # every proof: root episodes + systems/
 npm run 01:bug
 ```
 

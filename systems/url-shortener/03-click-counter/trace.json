@@ -1,0 +1,449 @@
+{
+  "schemaVersion": 1,
+  "slug": "url-shortener-click-counter",
+  "number": 4,
+  "title": "Analytics on the hot path",
+  "question": "The owner wants a click count, so the redirect runs UPDATE clicks = clicks + 1. It works in the demo. What happens when an influencer shares the link?",
+  "why": "Every click becomes a write to the same row. Postgres lets one transaction update a row at a time, so concurrent clicks queue behind the row lock, each one holding a connection while it waits. The redirect, your hottest path, now moves at the speed of one row.",
+  "rule": "The hot path does only what the user is waiting for. Count clicks off it (an in-memory INCR or a queue), flush to the database in batches, and tell the interviewer the trade-off: counts lag by a few seconds.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/url-shortener/03-click-counter",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "carol",
+      "label": "Carol",
+      "kind": "client"
+    },
+    {
+      "id": "redis",
+      "label": "Redis",
+      "kind": "cache"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    },
+    {
+      "id": "worker",
+      "label": "Flush worker",
+      "kind": "server"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "UPDATE on every click",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: counting the click inside the redirect.\n * Every click is now a write to ONE row. Postgres lets one\n * transaction update a row at a time, so a viral link queues up\n * and every redirect waits its turn on the hottest row you have.\n */\nexport async function redirect(ctx: Ctx, code: string) {\n  // step: count\n  await ctx.db.query(\"UPDATE links SET clicks = clicks + 1 WHERE code = $1\", [code]);\n\n  // step: lookup\n  const dest = await ctx.redis.get(`dest:${code}`);\n\n  // step: respond\n  return ctx.respond(`302 → ${dest}`);\n}\n\n/** Nothing to flush: the count is already in Postgres. */\nexport async function flushClicks(_ctx: Ctx, _code: string) {}\n",
+      "steps": {
+        "count": [
+          10,
+          11
+        ],
+        "lookup": [
+          13,
+          14
+        ],
+        "respond": [
+          16,
+          17
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "docs",
+            "clicks": 0
+          },
+          {
+            "code": "launch",
+            "clicks": 0
+          }
+        ],
+        "redis": [
+          {
+            "key": "dest:launch",
+            "value": "https://example.com/launch",
+            "ttl_s": null
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 21.5,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 21.5,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 21.5,
+          "actor": "carol",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 24.4,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET clicks = clicks + 1 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "docs",
+                "clicks": 0
+              },
+              {
+                "code": "launch",
+                "clicks": 2
+              }
+            ],
+            "redis": [
+              {
+                "key": "dest:launch",
+                "value": "https://example.com/launch",
+                "ttl_s": null
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 25.3,
+          "actor": "bob",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 25.4,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 25.4,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET clicks = clicks + 1 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "docs",
+                "clicks": 0
+              },
+              {
+                "code": "launch",
+                "clicks": 3
+              }
+            ],
+            "redis": [
+              {
+                "key": "dest:launch",
+                "value": "https://example.com/launch",
+                "ttl_s": null
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 25.6,
+          "actor": "carol",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET clicks = clicks + 1 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "docs",
+                "clicks": 0
+              },
+              {
+                "code": "launch",
+                "clicks": 3
+              }
+            ],
+            "redis": [
+              {
+                "key": "dest:launch",
+                "value": "https://example.com/launch",
+                "ttl_s": null
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 26.1,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 26.1,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 26.5,
+          "actor": "carol",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 26.5,
+          "actor": "carol",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 26.5,
+          "actor": "worker",
+          "type": "note",
+          "label": "every 5s: fold counts into Postgres"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "3 clicks → 3 writes to the same row, one at a time."
+      }
+    },
+    "fix": {
+      "label": "INCR in memory, batch flush",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: the redirect only redirects. Counting happens off the hot path.\n * INCR is atomic and in memory: no row lock, no disk, no queue.\n * A worker folds the count into Postgres every few seconds: one write, not thousands.\n */\nexport async function redirect(ctx: Ctx, code: string) {\n  // step: count\n  await ctx.redis.incr(`clicks:${code}`);\n\n  // step: lookup\n  const dest = await ctx.redis.get(`dest:${code}`);\n\n  // step: respond\n  return ctx.respond(`302 → ${dest}`);\n}\n\n/** Background worker, every ~5s. Counts lag by that much. Say so in the interview. */\nexport async function flushClicks(ctx: Ctx, code: string) {\n  // step: flush\n  const n = await ctx.redis.getdel(`clicks:${code}`);\n  if (n > 0) {\n    await ctx.db.query(\"UPDATE links SET clicks = clicks + $2 WHERE code = $1\", [code, n]);\n  }\n}\n",
+      "steps": {
+        "count": [
+          9,
+          10
+        ],
+        "lookup": [
+          12,
+          13
+        ],
+        "respond": [
+          15,
+          20
+        ],
+        "flush": [
+          21,
+          25
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "docs",
+            "clicks": 0
+          },
+          {
+            "code": "launch",
+            "clicks": 0
+          }
+        ],
+        "redis": [
+          {
+            "key": "dest:launch",
+            "value": "https://example.com/launch",
+            "ttl_s": null
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 23.2,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 23.2,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 23.2,
+          "actor": "carol",
+          "type": "request",
+          "label": "GET /launch"
+        },
+        {
+          "t": 23.4,
+          "actor": "alice",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR clicks:launch → 1",
+          "detail": "Atomic in-memory increment. No row lock, no disk.",
+          "step": "count"
+        },
+        {
+          "t": 23.5,
+          "actor": "bob",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR clicks:launch → 2",
+          "detail": "Atomic in-memory increment. No row lock, no disk.",
+          "step": "count"
+        },
+        {
+          "t": 23.5,
+          "actor": "carol",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR clicks:launch → 3",
+          "detail": "Atomic in-memory increment. No row lock, no disk.",
+          "step": "count"
+        },
+        {
+          "t": 23.5,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 23.5,
+          "actor": "bob",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 23.5,
+          "actor": "carol",
+          "target": "redis",
+          "type": "read",
+          "label": "GET dest:launch → 'https://example.com/launch'",
+          "step": "lookup"
+        },
+        {
+          "t": 23.5,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 23.5,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 23.5,
+          "actor": "carol",
+          "type": "response",
+          "label": "302 → https://example.com/launch",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 23.6,
+          "actor": "worker",
+          "type": "note",
+          "label": "every 5s: fold counts into Postgres"
+        },
+        {
+          "t": 23.7,
+          "actor": "worker",
+          "target": "redis",
+          "type": "write",
+          "label": "GETDEL clicks:launch → 3",
+          "detail": "Read the count and reset it in one step.",
+          "state": {
+            "links": [
+              {
+                "code": "docs",
+                "clicks": 0
+              },
+              {
+                "code": "launch",
+                "clicks": 0
+              }
+            ],
+            "redis": [
+              {
+                "key": "dest:launch",
+                "value": "https://example.com/launch",
+                "ttl_s": null
+              }
+            ]
+          },
+          "step": "flush"
+        },
+        {
+          "t": 26.3,
+          "actor": "worker",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET clicks = clicks + $2 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "docs",
+                "clicks": 0
+              },
+              {
+                "code": "launch",
+                "clicks": 3
+              }
+            ],
+            "redis": [
+              {
+                "key": "dest:launch",
+                "value": "https://example.com/launch",
+                "ttl_s": null
+              }
+            ]
+          },
+          "step": "flush"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "3 clicks → 0 DB writes during the storm, 1 batched write after. Count: 3."
+      }
+    }
+  },
+  "generatedAt": "2026-10-31T10:22:30.192Z"
+}

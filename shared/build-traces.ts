@@ -4,8 +4,9 @@
  *
  *   npm run trace              → all episodes
  *   npm run trace -- 01        → just episode 01
+ *   npm run trace -- systems/url-shortener → every trap in that system
  */
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { access, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createPool } from "./db.ts";
@@ -43,11 +44,17 @@ export function parseSteps(source: string): Record<string, [number, number]> {
 
 function resolveStep(anchor: string | undefined, source: string, steps: Record<string, [number, number]>) {
   if (!anchor) return undefined;
-  const needle = anchor.split("\n")[0].trim();
-  const lineIdx = source.split("\n").findIndex((l) => l.includes(needle));
-  if (lineIdx < 0) return undefined;
-  const line = lineIdx + 1;
-  return Object.entries(steps).find(([, [s, e]]) => line >= s && line <= e)?.[0];
+  // anchor lines are candidates in priority order; first one found in the source wins
+  const lines = source.split("\n");
+  for (const candidate of anchor.split("\n")) {
+    const needle = candidate.trim();
+    if (!needle) continue;
+    const lineIdx = lines.findIndex((l) => l.includes(needle));
+    if (lineIdx < 0) continue;
+    const line = lineIdx + 1;
+    return Object.entries(steps).find(([, [s, e]]) => line >= s && line <= e)?.[0];
+  }
+  return undefined;
 }
 
 async function buildVariant(ep: Episode, dir: string, variant: VariantName): Promise<Variant> {
@@ -65,7 +72,7 @@ async function buildVariant(ep: Episode, dir: string, variant: VariantName): Pro
       .map(({ anchor, ...e }) => ({ ...e, step: e.step ?? resolveStep(anchor, source, steps) }));
 
     const verdict = ep.verdict(variant, result);
-    if (!verdict.ok) {
+    if (!verdict.ok && ep.exclusiveSuccess !== false) {
       // every success after the first one is a lie the system told a user
       events.filter((e) => e.type === "response" && e.severity === "ok").slice(1).forEach((e) => {
         e.severity = "bad";
@@ -79,11 +86,30 @@ async function buildVariant(ep: Episode, dir: string, variant: VariantName): Pro
   }
 }
 
+/** Numbered episode folders (`NN-slug`) with an episode.ts, as paths relative to the repo root. */
+async function episodeDirs(base: string): Promise<string[]> {
+  const entries = await readdir(join(ROOT, base), { withFileTypes: true }).catch(() => []);
+  const found: string[] = [];
+  for (const d of entries) {
+    if (!d.isDirectory() || !/^\d{2}-/.test(d.name)) continue;
+    const rel = base ? `${base}/${d.name}` : d.name;
+    if (await access(join(ROOT, rel, "episode.ts")).then(() => true, () => false)) found.push(rel);
+  }
+  return found.sort();
+}
+
+// root episodes, then every systems/<system>/NN-slug day that has a trap
+const systems = (await readdir(join(ROOT, "systems"), { withFileTypes: true }).catch(() => []))
+  .filter((d) => d.isDirectory())
+  .map((d) => `systems/${d.name}`);
+const all = [...(await episodeDirs("")), ...(await Promise.all(systems.map(episodeDirs))).flat()];
+
+// npm run trace -- 01            → root episode 01
+// npm run trace -- id-collision  → any folder whose path contains it
 const only = process.argv[2];
-const dirs = (await readdir(ROOT, { withFileTypes: true }))
-  .filter((d) => d.isDirectory() && /^\d{2}-/.test(d.name) && (!only || d.name.startsWith(only)))
-  .map((d) => d.name)
-  .sort();
+const dirs = all.filter(
+  (rel) => !only || rel.startsWith(only) || (!/^\d{2}$/.test(only) && rel.includes(only)),
+);
 
 for (const name of dirs) {
   const dir = join(ROOT, name);

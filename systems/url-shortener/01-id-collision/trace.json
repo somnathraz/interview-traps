@@ -1,0 +1,325 @@
+{
+  "schemaVersion": 1,
+  "slug": "url-shortener-id-collision",
+  "number": 2,
+  "title": "The ID collision",
+  "question": "Two users shorten different URLs at the same instant. Your counter is SELECT MAX(id) + 1. Do they get different short codes?",
+  "why": "Both requests read the same MAX(id) before either one inserts, so both compute the same next id and the same base62 code. Without a UNIQUE constraint, one short code now points at two different URLs.",
+  "rule": "Never generate ids with MAX(id) + 1. Let the database hand them out atomically (a sequence / IDENTITY column), and back the code column with a UNIQUE constraint.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/url-shortener/01-id-collision",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "SELECT MAX(id) + 1",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\nimport { toBase62 } from \"../base62.ts\";\n\n/**\n * BUG: MAX(id) + 1.\n * Reading the highest id and inserting id + 1 are two separate moments.\n * Every request that reads in between gets the same id, so the same short code.\n */\nexport async function shorten(ctx: Ctx, longUrl: string, owner: string) {\n  // step: read\n  const { rows } = await ctx.db.query(\"SELECT MAX(id) AS max_id FROM urls\");\n  const id = Number(rows[0].max_id) + 1;\n\n  // step: encode\n  const code = toBase62(id);\n\n  // step: write\n  await ctx.db.query(\n    \"INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)\",\n    [id, code, longUrl, owner],\n  );\n\n  // step: respond\n  return ctx.respond(`SHORTENED /${code}`);\n}\n",
+      "steps": {
+        "read": [
+          10,
+          12
+        ],
+        "encode": [
+          14,
+          15
+        ],
+        "write": [
+          17,
+          21
+        ],
+        "respond": [
+          23,
+          24
+        ]
+      },
+      "initialState": {
+        "urls": [
+          {
+            "id": 999,
+            "code": "g7",
+            "long_url": "https://example.com/old-post",
+            "owner": "seed"
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 31.7,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /shorten { url: \"https://example.com/alice-launch\" }"
+        },
+        {
+          "t": 31.7,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /shorten { url: \"https://example.com/bob-launch\" }"
+        },
+        {
+          "t": 34.5,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT urls → max_id = '999'",
+          "detail": "SELECT MAX(id) AS max_id FROM urls",
+          "step": "read"
+        },
+        {
+          "t": 36.2,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT urls → max_id = '999'",
+          "detail": "SELECT MAX(id) AS max_id FROM urls",
+          "step": "read"
+        },
+        {
+          "t": 37,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT urls → 1 row changed",
+          "detail": "INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)",
+          "state": {
+            "urls": [
+              {
+                "id": 999,
+                "code": "g7",
+                "long_url": "https://example.com/old-post",
+                "owner": "seed"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/alice-launch",
+                "owner": "alice"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/bob-launch",
+                "owner": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 37.4,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT urls → 1 row changed",
+          "detail": "INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)",
+          "state": {
+            "urls": [
+              {
+                "id": 999,
+                "code": "g7",
+                "long_url": "https://example.com/old-post",
+                "owner": "seed"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/alice-launch",
+                "owner": "alice"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/bob-launch",
+                "owner": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 38.6,
+          "actor": "bob",
+          "type": "response",
+          "label": "SHORTENED /g8",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 38.8,
+          "actor": "alice",
+          "type": "response",
+          "label": "SHORTENED /g8",
+          "severity": "ok",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "1 short code(s) handed out twice. /g8 now belongs to alice, bob (2 users affected)."
+      }
+    },
+    "fix": {
+      "label": "Postgres sequence (nextval)",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\nimport { toBase62 } from \"../base62.ts\";\n\n/**\n * FIX: let Postgres hand out the number.\n * nextval() is atomic: two concurrent callers never get the same value.\n * It's also non-transactional, so a rolled-back insert leaves a gap. That's expected.\n */\nexport async function shorten(ctx: Ctx, longUrl: string, owner: string) {\n  // step: claim\n  const { rows } = await ctx.db.query(\"SELECT nextval('url_id_seq') AS id\");\n  const id = Number(rows[0].id);\n\n  // step: encode\n  const code = toBase62(id);\n\n  // step: write\n  await ctx.db.query(\n    \"INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)\",\n    [id, code, longUrl, owner],\n  );\n\n  // step: respond\n  return ctx.respond(`SHORTENED /${code}`);\n}\n",
+      "steps": {
+        "claim": [
+          10,
+          12
+        ],
+        "encode": [
+          14,
+          15
+        ],
+        "write": [
+          17,
+          21
+        ],
+        "respond": [
+          23,
+          24
+        ]
+      },
+      "initialState": {
+        "urls": [
+          {
+            "id": 999,
+            "code": "g7",
+            "long_url": "https://example.com/old-post",
+            "owner": "seed"
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 23.3,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /shorten { url: \"https://example.com/alice-launch\" }"
+        },
+        {
+          "t": 23.3,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /shorten { url: \"https://example.com/bob-launch\" }"
+        },
+        {
+          "t": 25.5,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT url_id_seq → id = '1000'",
+          "detail": "SELECT nextval('url_id_seq') AS id",
+          "step": "claim"
+        },
+        {
+          "t": 26.1,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT url_id_seq → id = '1001'",
+          "detail": "SELECT nextval('url_id_seq') AS id",
+          "step": "claim"
+        },
+        {
+          "t": 27.4,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT urls → 1 row changed",
+          "detail": "INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)",
+          "state": {
+            "urls": [
+              {
+                "id": 999,
+                "code": "g7",
+                "long_url": "https://example.com/old-post",
+                "owner": "seed"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/alice-launch",
+                "owner": "alice"
+              },
+              {
+                "id": 1001,
+                "code": "g9",
+                "long_url": "https://example.com/bob-launch",
+                "owner": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 28.3,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT urls → 1 row changed",
+          "detail": "INSERT INTO urls (id, code, long_url, owner) VALUES ($1, $2, $3, $4)",
+          "state": {
+            "urls": [
+              {
+                "id": 999,
+                "code": "g7",
+                "long_url": "https://example.com/old-post",
+                "owner": "seed"
+              },
+              {
+                "id": 1000,
+                "code": "g8",
+                "long_url": "https://example.com/alice-launch",
+                "owner": "alice"
+              },
+              {
+                "id": 1001,
+                "code": "g9",
+                "long_url": "https://example.com/bob-launch",
+                "owner": "bob"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 28.6,
+          "actor": "alice",
+          "type": "response",
+          "label": "SHORTENED /g8",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 29.3,
+          "actor": "bob",
+          "type": "response",
+          "label": "SHORTENED /g9",
+          "severity": "ok",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "2 users, 2 different short codes. No collisions."
+      }
+    }
+  },
+  "generatedAt": "2026-10-31T10:22:29.979Z"
+}

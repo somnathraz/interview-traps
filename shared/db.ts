@@ -16,6 +16,8 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * which hides the bug locally while it still bites you in production.
  */
 export async function warmPool(pool: pg.Pool, n: number) {
-  const clients = await Promise.all(Array.from({ length: n }, () => pool.connect()));
+  // never ask for more than the pool can hold: the extra connect()s would wait forever
+  const count = Math.min(n, pool.options.max ?? n);
+  const clients = await Promise.all(Array.from({ length: count }, () => pool.connect()));
   clients.forEach((c) => c.release());
 }

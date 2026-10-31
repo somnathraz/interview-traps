@@ -1,0 +1,480 @@
+{
+  "schemaVersion": 1,
+  "slug": "url-shortener-stale-redirect",
+  "number": 3,
+  "title": "The stale redirect",
+  "question": "You fixed a typo in a short link's destination and hit Save. The database has the new URL. Why are visitors still landing on the old 404 page?",
+  "why": "Redirects read Redis first. The update wrote only to Postgres, so the cached copy keeps serving the old destination until its TTL runs out. The database is right; users still get the wrong answer.",
+  "rule": "Every cache needs an answer to: when the data changes, who invalidates it? Delete (or overwrite) the key in the same code path that writes the DB, and use 302, not 301, for links that can change. Browsers cache 301s, so you can't invalidate those.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/url-shortener/02-stale-redirect",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "owner",
+      "label": "Owner",
+      "kind": "client"
+    },
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "redis",
+      "label": "Redis",
+      "kind": "cache"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Update DB only",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: the update writes the database and forgets the cache.\n * Redirects read Redis first, so they keep serving the old\n * destination until the key expires on its own (an hour here).\n */\nexport async function redirect(ctx: Ctx, code: string) {\n  // step: cache\n  let dest = await ctx.redis.get(code);\n\n  // step: miss\n  if (dest === null) {\n    const { rows } = await ctx.db.query(\"SELECT dest FROM links WHERE code = $1\", [code]);\n    dest = String(rows[0].dest);\n    await ctx.redis.set(code, dest, { ttlSeconds: 3600 });\n  }\n\n  // step: respond\n  return ctx.respond(`302 → ${dest}`);\n}\n\nexport async function updateLink(ctx: Ctx, code: string, newDest: string) {\n  // step: update\n  await ctx.db.query(\"UPDATE links SET dest = $2 WHERE code = $1\", [code, newDest]);\n\n  // step: saved\n  return ctx.respond(\"SAVED\");\n}\n",
+      "steps": {
+        "cache": [
+          9,
+          10
+        ],
+        "miss": [
+          12,
+          17
+        ],
+        "respond": [
+          19,
+          23
+        ],
+        "update": [
+          24,
+          25
+        ],
+        "saved": [
+          27,
+          28
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "diwali",
+            "dest": "https://shop.com/dwali-sale"
+          }
+        ],
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 21,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 21.4,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → miss",
+          "step": "cache"
+        },
+        {
+          "t": 22.7,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://shop.com/dwali-sale'",
+          "detail": "SELECT dest FROM links WHERE code = $1",
+          "step": "miss"
+        },
+        {
+          "t": 23,
+          "actor": "alice",
+          "target": "redis",
+          "type": "write",
+          "label": "SET diwali = 'https://shop.com/dwali-sale' (expires in 3600s)",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/dwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/dwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "miss"
+        },
+        {
+          "t": 23.7,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://shop.com/dwali-sale",
+          "step": "respond"
+        },
+        {
+          "t": 23.7,
+          "actor": "owner",
+          "type": "request",
+          "label": "PATCH /links/diwali { dest: \"https://shop.com/diwali-sale\" }"
+        },
+        {
+          "t": 25.1,
+          "actor": "owner",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET dest = $2 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/diwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/dwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "update"
+        },
+        {
+          "t": 25.5,
+          "actor": "owner",
+          "type": "response",
+          "label": "SAVED",
+          "severity": "ok",
+          "step": "saved"
+        },
+        {
+          "t": 25.5,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 25.5,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 25.6,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → 'https://shop.com/dwali-sale'",
+          "step": "cache"
+        },
+        {
+          "t": 25.6,
+          "actor": "bob",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → 'https://shop.com/dwali-sale'",
+          "step": "cache"
+        },
+        {
+          "t": 25.6,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://shop.com/dwali-sale",
+          "severity": "bad",
+          "step": "respond"
+        },
+        {
+          "t": 25.6,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://shop.com/dwali-sale",
+          "severity": "bad",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Saved, and the database says https://shop.com/diwali-sale. 2 of 2 visitors after the fix still went to the old 404 page."
+      }
+    },
+    "fix": {
+      "label": "Update DB, then delete the cache key",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: whoever changes the data invalidates the cache.\n * Delete the key right after the DB write; the next redirect\n * misses, reads the new destination and caches that instead.\n */\nexport async function redirect(ctx: Ctx, code: string) {\n  // step: cache\n  let dest = await ctx.redis.get(code);\n\n  // step: miss\n  if (dest === null) {\n    const { rows } = await ctx.db.query(\"SELECT dest FROM links WHERE code = $1\", [code]);\n    dest = String(rows[0].dest);\n    await ctx.redis.set(code, dest, { ttlSeconds: 3600 });\n  }\n\n  // step: respond\n  return ctx.respond(`302 → ${dest}`);\n}\n\nexport async function updateLink(ctx: Ctx, code: string, newDest: string) {\n  // step: update\n  await ctx.db.query(\"UPDATE links SET dest = $2 WHERE code = $1\", [code, newDest]);\n\n  // step: invalidate\n  await ctx.redis.del(code);\n\n  // step: saved\n  return ctx.respond(\"SAVED\");\n}\n",
+      "steps": {
+        "cache": [
+          9,
+          10
+        ],
+        "miss": [
+          12,
+          17
+        ],
+        "respond": [
+          19,
+          23
+        ],
+        "update": [
+          24,
+          25
+        ],
+        "invalidate": [
+          27,
+          28
+        ],
+        "saved": [
+          30,
+          31
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "diwali",
+            "dest": "https://shop.com/dwali-sale"
+          }
+        ],
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 19.2,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 19.5,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → miss",
+          "step": "cache"
+        },
+        {
+          "t": 21,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://shop.com/dwali-sale'",
+          "detail": "SELECT dest FROM links WHERE code = $1",
+          "step": "miss"
+        },
+        {
+          "t": 21,
+          "actor": "alice",
+          "target": "redis",
+          "type": "write",
+          "label": "SET diwali = 'https://shop.com/dwali-sale' (expires in 3600s)",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/dwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/dwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "miss"
+        },
+        {
+          "t": 21.6,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://shop.com/dwali-sale",
+          "step": "respond"
+        },
+        {
+          "t": 21.6,
+          "actor": "owner",
+          "type": "request",
+          "label": "PATCH /links/diwali { dest: \"https://shop.com/diwali-sale\" }"
+        },
+        {
+          "t": 22.9,
+          "actor": "owner",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE links → 1 row changed",
+          "detail": "UPDATE links SET dest = $2 WHERE code = $1",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/diwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/dwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "update"
+        },
+        {
+          "t": 23.3,
+          "actor": "owner",
+          "target": "redis",
+          "type": "write",
+          "label": "DEL diwali → 1 key removed",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/diwali-sale"
+              }
+            ],
+            "redis": []
+          },
+          "step": "invalidate"
+        },
+        {
+          "t": 23.6,
+          "actor": "owner",
+          "type": "response",
+          "label": "SAVED",
+          "severity": "ok",
+          "step": "saved"
+        },
+        {
+          "t": 23.7,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 23.7,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /diwali"
+        },
+        {
+          "t": 23.7,
+          "actor": "alice",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → miss",
+          "step": "cache"
+        },
+        {
+          "t": 23.7,
+          "actor": "bob",
+          "target": "redis",
+          "type": "read",
+          "label": "GET diwali → miss",
+          "step": "cache"
+        },
+        {
+          "t": 25.3,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://shop.com/diwali-sale'",
+          "detail": "SELECT dest FROM links WHERE code = $1",
+          "step": "miss"
+        },
+        {
+          "t": 25.4,
+          "actor": "alice",
+          "target": "redis",
+          "type": "write",
+          "label": "SET diwali = 'https://shop.com/diwali-sale' (expires in 3600s)",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/diwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/diwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "miss"
+        },
+        {
+          "t": 25.7,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://shop.com/diwali-sale'",
+          "detail": "SELECT dest FROM links WHERE code = $1",
+          "step": "miss"
+        },
+        {
+          "t": 25.7,
+          "actor": "bob",
+          "target": "redis",
+          "type": "write",
+          "label": "SET diwali = 'https://shop.com/diwali-sale' (expires in 3600s)",
+          "state": {
+            "links": [
+              {
+                "code": "diwali",
+                "dest": "https://shop.com/diwali-sale"
+              }
+            ],
+            "redis": [
+              {
+                "key": "diwali",
+                "value": "https://shop.com/diwali-sale",
+                "ttl_s": 3600
+              }
+            ]
+          },
+          "step": "miss"
+        },
+        {
+          "t": 25.9,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://shop.com/diwali-sale",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 26.3,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://shop.com/diwali-sale",
+          "severity": "ok",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "All 2 visitors after the fix went to the new page. The cache was cleared on save."
+      }
+    }
+  },
+  "generatedAt": "2026-10-31T10:22:30.089Z"
+}

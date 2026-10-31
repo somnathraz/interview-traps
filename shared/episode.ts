@@ -26,6 +26,12 @@ export interface Episode {
   /** users used for the replay trace. Keep it small (2-3) so the sim is readable. */
   traceUsers: string[];
   variantLabels: Record<VariantName, string>;
+  /**
+   * True (default) when only one user can legitimately succeed (one seat, one alias):
+   * on a failed run the trace builder marks every success after the first as the bug.
+   * Set false when many successes are fine (every user shortening their own URL).
+   */
+  exclusiveSuccess?: boolean;
   actors(users: string[]): Actor[];
   reset(pool: pg.Pool): Promise<void>;
   snapshot(pool: pg.Pool): Promise<StoreState>;

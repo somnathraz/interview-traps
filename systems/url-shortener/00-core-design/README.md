@@ -21,7 +21,7 @@ id = next_id()              # 1, 2, 3, ...
 short_code = to_base62(id)  # unique by construction, no retry
 ```
 
-No collision possible — every ID is issued once. Trade-off introduced here and resolved on Day 2: a single centralized counter becomes a contention point at high write volume.
+No collision possible — every ID is issued once, **as long as `next_id()` is atomic**. Day 2 shows what happens when it isn't (`MAX(id) + 1`). The other trade-off, a single central counter becoming a contention point at very high write volume, is answered with range allocation or Snowflake-style ids.
 
 ## The other senior signal: read-heavy
 
@@ -38,7 +38,8 @@ The signal isn't the code — it's naming the trade-off out loud. Hash avoids a 
 
 ## This week
 
-- Day 2: the counter from this episode, hit by two concurrent requests at the same instant.
-- Day 3: the redirect cache from the read-heavy design, serving stale destinations.
-- Day 4-6: analytics write contention, vanity alias races, cleanup at scale.
+- [Day 2](../01-id-collision): the counter from this episode, built as `MAX(id) + 1`, hit by 50 concurrent requests.
+- [Day 3](../02-stale-redirect): the redirect cache from the read-heavy design, serving stale destinations.
+- [Day 4](../03-click-counter): click analytics written on the redirect path.
+- Day 5-6: vanity alias races, cleanup at scale.
 - Day 7: all of the above, rolled into one post.
