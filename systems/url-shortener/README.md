@@ -12,14 +12,14 @@ Each day still gets a reel. The code traps here follow the same contract as the 
 | Tue | ID collision | `MAX(id) + 1` under 50 concurrent requests: every user gets the same code | [trap](./01-id-collision) · `npm run shortener:bug -- id-collision` |
 | Wed | Stale redirect | Destination fixed in the DB, Redis keeps serving the old one (+ why 301 makes it worse) | [trap](./02-stale-redirect) · `npm run shortener:bug -- stale-redirect` |
 | Thu | Analytics on the hot path | `UPDATE clicks = clicks + 1` in the redirect: every click queues on one row | [trap](./03-click-counter) · `npm run shortener:bug -- click-counter` |
-| Fri | Vanity alias race | Two users claim the same custom alias at once | coming |
+| Fri | Vanity alias race | Check-then-upsert: 50 users told `/launch` is theirs, 49 links hijacked | [trap](./04-vanity-alias-race) · `npm run shortener:bug -- vanity-alias` |
 | Sat | Cleanup at scale | Naive `DELETE WHERE expired` locks the table at billions of rows | coming |
 | Sun | Rollup | Blog post covering all of the above, cross-posted | — |
 
 ## Run
 
 ```bash
-npm run shortener:bug -- id-collision        # or stale-redirect, click-counter
+npm run shortener:bug -- id-collision        # or stale-redirect, click-counter, vanity-alias
 npm run shortener:fix -- id-collision
 npm run shortener:bug -- click-counter --users 85
 npm test                                     # every proof, root episodes + this week

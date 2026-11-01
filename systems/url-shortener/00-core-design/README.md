@@ -41,5 +41,6 @@ The signal isn't the code — it's naming the trade-off out loud. Hash avoids a 
 - [Day 2](../01-id-collision): the counter from this episode, built as `MAX(id) + 1`, hit by 50 concurrent requests.
 - [Day 3](../02-stale-redirect): the redirect cache from the read-heavy design, serving stale destinations.
 - [Day 4](../03-click-counter): click analytics written on the redirect path.
-- Day 5-6: vanity alias races, cleanup at scale.
+- [Day 5](../04-vanity-alias-race): two users claim the same custom alias at once.
+- Day 6: cleanup at scale.
 - Day 7: all of the above, rolled into one post.

@@ -1,0 +1,276 @@
+{
+  "schemaVersion": 1,
+  "slug": "url-shortener-vanity-alias-race",
+  "number": 5,
+  "title": "The vanity alias race",
+  "question": "Two users claim the custom alias /launch at the same second. Your code checks it's free, then saves it with an upsert so retries don't error. Who gets /launch?",
+  "why": "Both requests pass the 'is it free?' check before either one writes. The upsert then turns the conflict into a silent overwrite: both users are told CLAIMED, and the first user's link now redirects to the second user's site.",
+  "rule": "Let the unique index decide, in one statement: INSERT … ON CONFLICT DO NOTHING RETURNING. Zero rows means taken (or your own retry). Use DO UPDATE only when overwriting someone else's row is what you actually want.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/url-shortener/04-vanity-alias-race",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Check, then upsert",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: check if the alias is free, then upsert.\n * The upsert was added \"so retries don't error\". Under concurrency\n * everyone passes the check, and ON CONFLICT DO UPDATE quietly\n * overwrites whoever got there first. Everyone is told CLAIMED.\n */\nexport async function claimAlias(ctx: Ctx, alias: string, dest: string, owner: string) {\n  // step: check\n  const taken = await ctx.db.query(\"SELECT 1 FROM links WHERE code = $1\", [alias]);\n  if (taken.rowCount! > 0) {\n    return ctx.respond(\"TAKEN\");\n  }\n\n  // step: write\n  await ctx.db.query(\n    `INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3)\n     ON CONFLICT (code) DO UPDATE SET dest = EXCLUDED.dest, owner = EXCLUDED.owner`,\n    [alias, dest, owner],\n  );\n\n  // step: respond\n  return ctx.respond(\"CLAIMED\");\n}\n",
+      "steps": {
+        "check": [
+          10,
+          14
+        ],
+        "write": [
+          16,
+          21
+        ],
+        "respond": [
+          23,
+          24
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "sale",
+            "dest": "https://example.com/sale",
+            "owner": "seed"
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 28.5,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /aliases { alias: \"launch\", url: \"https://example.com/alice\" }"
+        },
+        {
+          "t": 28.5,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /aliases { alias: \"launch\", url: \"https://example.com/bob\" }"
+        },
+        {
+          "t": 31.9,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → 0 rows",
+          "detail": "SELECT 1 FROM links WHERE code = $1",
+          "step": "check"
+        },
+        {
+          "t": 32.9,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → 0 rows",
+          "detail": "SELECT 1 FROM links WHERE code = $1",
+          "step": "check"
+        },
+        {
+          "t": 33.5,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT links → 1 row changed",
+          "detail": "INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3) ON CONFLICT (code) DO UPDATE SET dest = EXCLUDED.dest, owner = EXCLUDED.owner",
+          "state": {
+            "links": [
+              {
+                "code": "launch",
+                "dest": "https://example.com/bob",
+                "owner": "bob"
+              },
+              {
+                "code": "sale",
+                "dest": "https://example.com/sale",
+                "owner": "seed"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 34.4,
+          "actor": "bob",
+          "type": "response",
+          "label": "CLAIMED",
+          "severity": "ok",
+          "step": "respond"
+        },
+        {
+          "t": 34.6,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT links → 1 row changed",
+          "detail": "INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3) ON CONFLICT (code) DO UPDATE SET dest = EXCLUDED.dest, owner = EXCLUDED.owner",
+          "state": {
+            "links": [
+              {
+                "code": "launch",
+                "dest": "https://example.com/alice",
+                "owner": "alice"
+              },
+              {
+                "code": "sale",
+                "dest": "https://example.com/sale",
+                "owner": "seed"
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 35.6,
+          "actor": "alice",
+          "type": "response",
+          "label": "CLAIMED",
+          "severity": "bad",
+          "step": "respond",
+          "detail": "A second success for something only one user can have. This is the bug."
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "2 users were told /launch is theirs. It belongs to alice. The other 1 shared a link that now sends their clicks to https://example.com/alice."
+      }
+    },
+    "fix": {
+      "label": "INSERT … ON CONFLICT DO NOTHING",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: no check. One statement, and the unique index decides.\n * DO NOTHING means a conflict changes nothing and returns 0 rows.\n * A retry from the same owner is still a success: that's real idempotency.\n */\nexport async function claimAlias(ctx: Ctx, alias: string, dest: string, owner: string) {\n  // step: claim\n  const won = await ctx.db.query(\n    `INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3)\n     ON CONFLICT (code) DO NOTHING\n     RETURNING code`,\n    [alias, dest, owner],\n  );\n  if (won.rowCount === 1) {\n    return ctx.respond(\"CLAIMED\");\n  }\n\n  // step: retry\n  const { rows } = await ctx.db.query(\"SELECT owner FROM links WHERE code = $1\", [alias]);\n  if (rows[0]?.owner === owner) {\n    return ctx.respond(\"CLAIMED\");\n  }\n\n  // step: respond\n  return ctx.respond(\"TAKEN\");\n}\n",
+      "steps": {
+        "claim": [
+          9,
+          18
+        ],
+        "retry": [
+          20,
+          24
+        ],
+        "respond": [
+          26,
+          27
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "code": "sale",
+            "dest": "https://example.com/sale",
+            "owner": "seed"
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 34.9,
+          "actor": "alice",
+          "type": "request",
+          "label": "POST /aliases { alias: \"launch\", url: \"https://example.com/alice\" }"
+        },
+        {
+          "t": 35.1,
+          "actor": "bob",
+          "type": "request",
+          "label": "POST /aliases { alias: \"launch\", url: \"https://example.com/bob\" }"
+        },
+        {
+          "t": 38.9,
+          "actor": "bob",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT links → 0 rows changed",
+          "detail": "INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3) ON CONFLICT (code) DO NOTHING RETURNING code",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "code": "launch",
+                "dest": "https://example.com/alice",
+                "owner": "alice"
+              },
+              {
+                "code": "sale",
+                "dest": "https://example.com/sale",
+                "owner": "seed"
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 40.5,
+          "actor": "alice",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT links → 1 row changed",
+          "detail": "INSERT INTO links (code, dest, owner) VALUES ($1, $2, $3) ON CONFLICT (code) DO NOTHING RETURNING code",
+          "state": {
+            "links": [
+              {
+                "code": "launch",
+                "dest": "https://example.com/alice",
+                "owner": "alice"
+              },
+              {
+                "code": "sale",
+                "dest": "https://example.com/sale",
+                "owner": "seed"
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 43,
+          "actor": "alice",
+          "type": "response",
+          "label": "CLAIMED",
+          "severity": "ok",
+          "step": "claim"
+        },
+        {
+          "t": 43.5,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → owner = 'alice'",
+          "detail": "SELECT owner FROM links WHERE code = $1",
+          "step": "retry"
+        },
+        {
+          "t": 43.5,
+          "actor": "bob",
+          "type": "response",
+          "label": "TAKEN",
+          "severity": "warn",
+          "step": "respond"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "/launch claimed once, by alice. 1 user(s) got TAKEN."
+      }
+    }
+  },
+  "generatedAt": "2026-11-01T12:32:29.359Z"
+}

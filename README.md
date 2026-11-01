@@ -29,7 +29,7 @@ Instead of one isolated trap, a system gets a full week: the design decision on 
 
 | System | Days | Status |
 |---|---|---|
-| [URL Shortener](./systems/url-shortener) | Core design → [ID collision](./systems/url-shortener/01-id-collision) → [stale redirect](./systems/url-shortener/02-stale-redirect) → [analytics on the hot path](./systems/url-shortener/03-click-counter) → vanity alias race → cleanup at scale → rollup | 4 of 7 days live · `npm run shortener:bug -- id-collision` |
+| [URL Shortener](./systems/url-shortener) | Core design → [ID collision](./systems/url-shortener/01-id-collision) → [stale redirect](./systems/url-shortener/02-stale-redirect) → [analytics on the hot path](./systems/url-shortener/03-click-counter) → [vanity alias race](./systems/url-shortener/04-vanity-alias-race) → cleanup at scale → rollup | 5 of 7 days live · `npm run shortener:bug -- id-collision` |
 
 See [`systems/url-shortener/README.md`](./systems/url-shortener/README.md) for this week's plan. Systems live in `systems/<name>/`, independent of the numbered episodes above.
 
