@@ -90,11 +90,22 @@ export function makeCtx({
 
     db: {
       async query(sql, params = []) {
-        const res = await pool.query(sql, params);
         const verb = compact(sql).split(" ")[0].toUpperCase();
         const isRead = verb === "SELECT";
         const table =
           /(?:FROM|UPDATE|INTO)\s+(\w+)/i.exec(sql)?.[1] ?? /nextval\('(\w+)'\)/i.exec(sql)?.[1] ?? "db";
+        let res: pg.QueryResult;
+        try {
+          res = await pool.query(sql, params);
+        } catch (err) {
+          // a failed statement is part of the story (timeouts, conflicts): trace it, then rethrow
+          const message = err instanceof Error ? err.message : String(err);
+          await tracer.event(
+            { actor, target: "db", type: isRead ? "read" : "write", label: `${verb} ${table} → ERROR: ${message}`, detail: compact(sql), anchor: sql, severity: "bad" },
+            { snapshot: !isRead },
+          );
+          throw err;
+        }
         const result = isRead ? summarizeRows(res.rows) : `${res.rowCount} row${res.rowCount === 1 ? "" : "s"} changed`;
         await tracer.event(
           {

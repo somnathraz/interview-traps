@@ -1,0 +1,3056 @@
+{
+  "schemaVersion": 1,
+  "slug": "url-shortener-cleanup-at-scale",
+  "number": 6,
+  "title": "Cleanup at scale",
+  "question": "Every night a cron job runs DELETE FROM links WHERE expires_at < now(). One morning you check: not a single row was deleted. Not last night either. Why?",
+  "why": "One statement is one transaction. On a huge table the DELETE runs past the statement timeout (or the job gets restarted mid-way) and Postgres rolls back every row it had deleted. The job fails the same way every night, and the table keeps growing.",
+  "rule": "Never delete millions of rows in one statement. Batch it in short transactions (walk the primary key in ranges), index the filter column, and at real scale partition by time so cleanup is DROP PARTITION.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/url-shortener/05-cleanup-at-scale",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "cron",
+      "label": "Cleanup cron",
+      "kind": "server"
+    },
+    {
+      "id": "alice",
+      "label": "Alice",
+      "kind": "client"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "One DELETE for everything",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: delete every expired link in one statement.\n * One statement = one transaction. If it hits the statement timeout\n * (or the deploy restarts the job) Postgres rolls ALL of it back.\n * Zero rows deleted, every night, while the table keeps growing.\n */\nexport async function cleanupExpired(ctx: Ctx) {\n  // step: delete\n  const res = await ctx.db.query(\"DELETE FROM links WHERE expires_at < now()\");\n\n  // step: report\n  return ctx.respond(`DELETED ${res.rowCount}`);\n}\n",
+      "steps": {
+        "delete": [
+          10,
+          11
+        ],
+        "report": [
+          13,
+          14
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "expired": 300000,
+            "live": 30000
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 21.3,
+          "actor": "cron",
+          "type": "request",
+          "label": "02:00 nightly cleanup (statement_timeout 29ms)"
+        },
+        {
+          "t": 22.4,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /live1"
+        },
+        {
+          "t": 22.4,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /live2"
+        },
+        {
+          "t": 25.3,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://example.com/live/2'",
+          "detail": "SELECT dest FROM links WHERE code = $1 AND expires_at > now()"
+        },
+        {
+          "t": 25.3,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://example.com/live/2",
+          "severity": "ok"
+        },
+        {
+          "t": 27.1,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://example.com/live/1'",
+          "detail": "SELECT dest FROM links WHERE code = $1 AND expires_at > now()"
+        },
+        {
+          "t": 27.1,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://example.com/live/1",
+          "severity": "ok"
+        },
+        {
+          "t": 59.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → ERROR: canceling statement due to statement timeout",
+          "detail": "DELETE FROM links WHERE expires_at < now()",
+          "severity": "bad",
+          "state": {
+            "links": [
+              {
+                "expired": 300000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "delete"
+        },
+        {
+          "t": 88.6,
+          "actor": "cron",
+          "type": "response",
+          "label": "FAILED: canceling statement due to statement timeout",
+          "severity": "bad"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Cleanup hit the statement timeout and rolled back: 300,000 expired links still there. Tomorrow night it fails the same way."
+      }
+    },
+    "fix": {
+      "label": "Primary-key range batches",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\nconst BATCH = 2000;\n\n/**\n * FIX: walk the primary key in small ranges, one short transaction each.\n * Every batch commits on its own: progress survives timeouts and restarts,\n * locks are held for milliseconds, and no batch rescans dead rows.\n */\nexport async function cleanupExpired(ctx: Ctx) {\n  // step: bounds\n  const { rows } = await ctx.db.query(\"SELECT min(id) AS lo, max(id) AS hi FROM links\");\n  let deleted = 0;\n\n  // step: batch\n  for (let from = Number(rows[0].lo); from <= Number(rows[0].hi); from += BATCH) {\n    const res = await ctx.db.query(\n      \"DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()\",\n      [from, from + BATCH],\n    );\n    deleted += res.rowCount ?? 0;\n  }\n\n  // step: report\n  return ctx.respond(`DELETED ${deleted}`);\n}\n",
+      "steps": {
+        "bounds": [
+          11,
+          13
+        ],
+        "batch": [
+          15,
+          22
+        ],
+        "report": [
+          24,
+          25
+        ]
+      },
+      "initialState": {
+        "links": [
+          {
+            "expired": 300000,
+            "live": 30000
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 14.5,
+          "actor": "cron",
+          "type": "request",
+          "label": "02:00 nightly cleanup (statement_timeout 23ms)"
+        },
+        {
+          "t": 15.3,
+          "actor": "alice",
+          "type": "request",
+          "label": "GET /live1"
+        },
+        {
+          "t": 15.3,
+          "actor": "bob",
+          "type": "request",
+          "label": "GET /live2"
+        },
+        {
+          "t": 17.1,
+          "actor": "alice",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://example.com/live/1'",
+          "detail": "SELECT dest FROM links WHERE code = $1 AND expires_at > now()"
+        },
+        {
+          "t": 17.1,
+          "actor": "alice",
+          "type": "response",
+          "label": "302 → https://example.com/live/1",
+          "severity": "ok"
+        },
+        {
+          "t": 17.7,
+          "actor": "bob",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → dest = 'https://example.com/live/2'",
+          "detail": "SELECT dest FROM links WHERE code = $1 AND expires_at > now()"
+        },
+        {
+          "t": 17.7,
+          "actor": "bob",
+          "type": "response",
+          "label": "302 → https://example.com/live/2",
+          "severity": "ok"
+        },
+        {
+          "t": 21.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT links → lo = '1', hi = '330000'",
+          "detail": "SELECT min(id) AS lo, max(id) AS hi FROM links",
+          "step": "bounds"
+        },
+        {
+          "t": 24.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 298000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 47.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 296000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 70.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 294000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 90.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 292000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 110.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 290000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 130.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 288000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 150.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 286000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 172.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 284000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 195.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 282000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 221.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 280000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 249.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 278000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 269.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 276000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 295.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 274000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 317.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 272000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 339.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 270000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 363.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 268000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 386.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 266000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 408,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 264000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 430.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 262000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 456.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 260000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 480.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 258000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 499.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 256000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 517.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 254000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 536.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 252000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 556.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 250000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 575.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 248000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 593.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 246000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 610.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 244000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 628.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 242000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 649.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 240000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 667.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 238000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 687,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 236000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 704.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 234000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 722.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 232000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 742.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 230000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 763,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 228000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 779.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 226000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 794.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 224000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 809.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 222000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 826.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 220000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 845.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 218000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 863.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 216000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 884.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 214000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 902.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 212000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 919,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 210000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 937.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 208000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 954.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 206000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 971.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 204000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 987.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 202000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1007.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 200000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1021.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 198000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1043.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 196000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1062.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 194000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1082.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 192000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1105.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 190000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1130.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 188000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1153.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 186000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1174.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 184000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1194,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 182000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1214.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 180000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1237.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 178000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1261.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 176000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1284.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 174000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1305.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 172000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1328.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 170000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1351.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 168000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1374.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 166000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1394.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 164000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1415.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 162000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1435.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 160000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1453.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 158000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1472.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 156000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1493.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 154000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1513.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 152000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1535.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 150000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1552.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 148000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1570.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 146000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1585.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 144000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1598.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 142000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1615.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 140000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1631.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 138000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1651.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 136000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1668,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 134000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1684.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 132000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1699.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 130000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1715.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 128000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1730.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 126000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1744.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 124000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1757.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 122000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1770.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 120000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1783.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 118000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1798.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 116000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1814.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 114000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1832,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 112000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1849.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 110000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1866.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 108000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1881.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 106000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1896.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 104000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1909.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 102000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1921.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 100000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1933.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 98000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1945.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 96000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1957.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 94000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1970.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 92000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1983,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 90000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 1996.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 88000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2009.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 86000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2025.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 84000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2041.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 82000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2054,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 80000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2066.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 78000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2081.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 76000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2094.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 74000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2109.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 72000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2129.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 70000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2144.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 68000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2158.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 66000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2173.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 64000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2185.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 62000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2197.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 60000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2210.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 58000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2223,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 56000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2236.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 54000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2249,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 52000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2261.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 50000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2273.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 48000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2285.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 46000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2295.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 44000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2306.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 42000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2315.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 40000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2324.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 38000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2334.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 36000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2344.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 34000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2355.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 32000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2364.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 30000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2374.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 28000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2384.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 26000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2397,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 24000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2409.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 22000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2422.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 20000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2432.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 18000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2444,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 16000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2454.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 14000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2465.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 12000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2478.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 10000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2490.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 8000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2502,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 6000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2515,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 4000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2529.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 2000,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2543.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 2000 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2555.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2565.3,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2575.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2586.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2594.5,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2604.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2614.9,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2626.4,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2634.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2643.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2651.6,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2658.7,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2666.2,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2673.8,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2684.1,
+          "actor": "cron",
+          "target": "db",
+          "type": "write",
+          "label": "DELETE links → 0 rows changed",
+          "detail": "DELETE FROM links WHERE id >= $1 AND id < $2 AND expires_at < now()",
+          "severity": "warn",
+          "state": {
+            "links": [
+              {
+                "expired": 0,
+                "live": 30000
+              }
+            ]
+          },
+          "step": "batch"
+        },
+        {
+          "t": 2693.6,
+          "actor": "cron",
+          "type": "response",
+          "label": "DELETED 300000",
+          "severity": "ok",
+          "step": "report"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "300,000 expired links deleted in short batches, none near the timeout. 30,000 live links untouched, 2 visitor(s) redirected fine."
+      }
+    }
+  },
+  "generatedAt": "2026-11-02T07:17:14.740Z"
+}
