@@ -16,6 +16,7 @@
     "01:fix": "tsx 01-booking-race-condition/run.ts fix",
     "shortener:bug": "tsx systems/url-shortener/run.ts bug",
     "shortener:fix": "tsx systems/url-shortener/run.ts fix",
+    "shortener:all": "tsx systems/url-shortener/run.ts all",
     "trace": "tsx shared/build-traces.ts",
     "test": "tsx --test \"*/proof.test.ts\" \"systems/*/*/proof.test.ts\"",
     "typecheck": "tsc --noEmit"
