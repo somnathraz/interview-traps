@@ -63,7 +63,7 @@ The number that shapes everything: 100:1. Optimise the redirect first.
 | Custom aliases | Check free, then upsert "so retries don't error" | Everyone passes the check; the upsert silently overwrites; all told `CLAIMED` | One statement: `INSERT … ON CONFLICT DO NOTHING RETURNING`; same-owner retry = success | [04-vanity-alias-race](../04-vanity-alias-race) |
 | Expiry cleanup | One `DELETE … WHERE expires_at < now()` | Runs past the timeout, rolls back everything: 0 deleted, every night | Primary-key range batches; at scale, monthly partitions + `DROP PARTITION` | [05-cleanup-at-scale](../05-cleanup-at-scale) |
 
-Three of the five are the same shape: **read, decide, write, with a gap in between** (ID collision, alias race, and [episode 01's](../../../01-booking-race-condition) double-booked seat). Learn to spot the gap and you've learned half of backend interviews.
+Two of the five are the same shape: **read, decide, write, with a gap in between** (the ID collision and the alias race), the same shape as [episode 01's](../../../01-booking-race-condition) double-booked seat. Learn to spot the gap and you'll catch a whole family of backend interview bugs.
 
 ## The five-minute interview answer
 
