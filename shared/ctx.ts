@@ -16,6 +16,8 @@ export interface Ctx {
     set(key: string, value: string | number, opts?: { ttlSeconds?: number }): Promise<void>;
     del(key: string): Promise<number>;
     incr(key: string): Promise<number>;
+    /** INCR + set TTL on first hit, atomically (a Lua script in real Redis). */
+    incrWithExpiry(key: string, ttlSeconds: number): Promise<number>;
     getdel(key: string): Promise<number>;
   };
   chargePayment(userId: string): Promise<void>;
@@ -79,6 +81,16 @@ export function makeCtx({
       async incr(key) {
         const n = redis.incr(key);
         await cacheEvent("write", `INCR ${key} → ${n}`, "ctx.redis.incr", "Atomic in-memory increment. No row lock, no disk.", false);
+        return n;
+      },
+      async incrWithExpiry(key, ttlSeconds) {
+        const n = redis.incrWithExpiry(key, ttlSeconds);
+        await cacheEvent(
+          "write",
+          `INCR ${key} → ${n} (TTL ${ttlSeconds}s, same atomic step)`,
+          "ctx.redis.incrWithExpiry",
+          "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+        );
         return n;
       },
       async getdel(key) {

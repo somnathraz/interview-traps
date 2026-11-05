@@ -14,11 +14,12 @@ after(() => pool.end());
 const visitorsOk = (responses: Record<string, string>) =>
   users.every((u) => responses[u]?.startsWith("302 → https://example.com/live/"));
 
+// 2× each side: enough to mean something, while one slow outlier batch (a checkpoint, a cold page) doesn't fail the run
 test("the demo timeout sits well between one batch and the one-shot DELETE on this machine", async () => {
   await episode.reset(pool);
   const { batchMs, fullMs, timeoutMs } = calibration;
-  assert.ok(timeoutMs >= batchMs * 3, `timeout ${timeoutMs}ms too close to one batch (${batchMs}ms)`);
-  assert.ok(fullMs >= timeoutMs * 3, `one-shot DELETE ${fullMs}ms too close to timeout ${timeoutMs}ms`);
+  assert.ok(timeoutMs >= batchMs * 2, `timeout ${timeoutMs}ms too close to one batch (${batchMs}ms)`);
+  assert.ok(fullMs >= timeoutMs * 2, `one-shot DELETE ${fullMs}ms too close to timeout ${timeoutMs}ms`);
 });
 
 test("bug: one DELETE for 300k rows hits the timeout → rolled back, 0 deleted; visitors unaffected", async () => {

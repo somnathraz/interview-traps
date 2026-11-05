@@ -1,0 +1,309 @@
+{
+  "schemaVersion": 1,
+  "slug": "rate-limiter-counter-race",
+  "number": 2,
+  "title": "The counter race",
+  "question": "Your limiter allows 10 requests per minute: GET the count, check it, SET count + 1. A script fires 50 requests at once. How many get through?",
+  "why": "Every request GETs the count before any of them SETs it, so they all see 0, all pass the check, and all write 1. The limit is checked against a number that's already stale.",
+  "rule": "Never GET-then-SET a counter. Increment and check in one atomic step: INCR and compare the result, or a Lua script that does check-and-spend inside Redis.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/rate-limiter/01-counter-race",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "req1",
+      "label": "Request 1",
+      "kind": "client"
+    },
+    {
+      "id": "req2",
+      "label": "Request 2",
+      "kind": "client"
+    },
+    {
+      "id": "req3",
+      "label": "Request 3",
+      "kind": "client"
+    },
+    {
+      "id": "redis",
+      "label": "Redis",
+      "kind": "cache"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "GET, check, SET",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: GET the count, check it, SET count + 1.\n * Two round trips with a gap in between. Every request that reads\n * before the first SET lands sees the same count and gets through.\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limit: number) {\n  const key = `rl:${apiKey}`;\n\n  // step: read\n  const count = Number((await ctx.redis.get(key)) ?? 0);\n\n  // step: check\n  if (count >= limit) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: write\n  await ctx.redis.set(key, count + 1, { ttlSeconds: 60 });\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "read": [
+          11,
+          12
+        ],
+        "check": [
+          14,
+          17
+        ],
+        "write": [
+          19,
+          20
+        ],
+        "allow": [
+          22,
+          23
+        ]
+      },
+      "initialState": {
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 0.1,
+          "actor": "req1",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 0.1,
+          "actor": "req2",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 0.1,
+          "actor": "req3",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 2.4,
+          "actor": "req1",
+          "target": "redis",
+          "type": "read",
+          "label": "GET rl:user1 → miss",
+          "step": "read"
+        },
+        {
+          "t": 2.4,
+          "actor": "req2",
+          "target": "redis",
+          "type": "read",
+          "label": "GET rl:user1 → miss",
+          "step": "read"
+        },
+        {
+          "t": 2.4,
+          "actor": "req3",
+          "target": "redis",
+          "type": "read",
+          "label": "GET rl:user1 → miss",
+          "step": "read"
+        },
+        {
+          "t": 2.5,
+          "actor": "req1",
+          "target": "redis",
+          "type": "write",
+          "label": "SET rl:user1 = 1 (expires in 60s)",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 2.6,
+          "actor": "req2",
+          "target": "redis",
+          "type": "write",
+          "label": "SET rl:user1 = 1 (expires in 60s)",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 2.6,
+          "actor": "req3",
+          "target": "redis",
+          "type": "write",
+          "label": "SET rl:user1 = 1 (expires in 60s)",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "write"
+        },
+        {
+          "t": 2.7,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 2.7,
+          "actor": "req2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 2.7,
+          "actor": "req3",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Limit 2, 3 of 3 requests got through. The counter says 1."
+      }
+    },
+    "fix": {
+      "label": "Atomic INCR, then check",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: increment first, check the number you got back. One atomic step.\n * Redis runs INCR one at a time, so every request gets a different number:\n * 1, 2, … 10 pass, 11 onwards are rejected. (Real Redis: a Lua script, like Stripe's.)\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limit: number) {\n  const key = `rl:${apiKey}`;\n\n  // step: count\n  const count = await ctx.redis.incrWithExpiry(key, 60);\n\n  // step: check\n  if (count > limit) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "count": [
+          11,
+          12
+        ],
+        "check": [
+          14,
+          17
+        ],
+        "allow": [
+          19,
+          20
+        ]
+      },
+      "initialState": {
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 0,
+          "actor": "req1",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 0,
+          "actor": "req2",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 0,
+          "actor": "req3",
+          "type": "request",
+          "label": "GET /v1/charges (key user1, limit 2/min)"
+        },
+        {
+          "t": 0.1,
+          "actor": "req1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.1,
+          "actor": "req2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 2 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 2,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.1,
+          "actor": "req3",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 3 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1",
+                "value": 3,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.1,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.1,
+          "actor": "req2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.1,
+          "actor": "req3",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "Limit 2: exactly 2 of 3 got through, the rest got 429. Counter: 3."
+      }
+    }
+  },
+  "generatedAt": "2026-11-05T08:24:57.632Z"
+}

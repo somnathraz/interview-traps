@@ -17,8 +17,11 @@
     "shortener:bug": "tsx systems/url-shortener/run.ts bug",
     "shortener:fix": "tsx systems/url-shortener/run.ts fix",
     "shortener:all": "tsx systems/url-shortener/run.ts all",
+    "limiter:bug": "tsx systems/rate-limiter/run.ts bug",
+    "limiter:fix": "tsx systems/rate-limiter/run.ts fix",
+    "limiter:all": "tsx systems/rate-limiter/run.ts all",
     "trace": "tsx shared/build-traces.ts",
-    "test": "tsx --test \"*/proof.test.ts\" \"systems/*/*/proof.test.ts\"",
+    "test": "tsx --test --test-concurrency=1 \"*/proof.test.ts\" \"systems/*/*/proof.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

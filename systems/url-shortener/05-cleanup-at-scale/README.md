@@ -18,7 +18,7 @@ npm run shortener:fix -- cleanup
 ✅ 300,000 expired links deleted in short batches, none near the timeout. 30,000 live links untouched, 50 visitor(s) redirected fine.
 ```
 
-**How the demo is scaled.** Production is a 30-second statement timeout against billions of rows. A laptop holds 330,000 rows, so the timeout is scaled down to match: on every run, `episode.ts` measures how long one 2,000-row batch takes and how long the one-shot `DELETE` takes on *your* machine, and sets the timeout in between. A typical run here: worst batch ~4–12ms, timeout ~25–45ms, one-shot `DELETE` ~140–160ms. The proof test fails if those margins ever get too thin to mean anything.
+**How the demo is scaled.** Production is a 30-second statement timeout against billions of rows. A laptop holds 330,000 rows, so the timeout is scaled down to match: on every run, `episode.ts` measures how long one 2,000-row batch takes and how long the one-shot `DELETE` takes on *your* machine, and sets the timeout in between. A typical run here: worst batch ~4–12ms, timeout ~25–45ms, one-shot `DELETE` ~140–160ms. The proof test fails if either margin drops below 2×.
 
 ## The bug: one DELETE for everything ([`bug.ts`](./bug.ts))
 

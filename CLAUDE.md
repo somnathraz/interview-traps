@@ -18,14 +18,14 @@ Folder `NN-slug/` with exactly: `bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts
 
 A "system" is a themed week (e.g. URL Shortener): one design episode plus several real bugs in that system, rolled into one blog post at the end. Lives in `systems/<system-slug>/`, independent of the flat `NN-slug/` episodes above — the flat list stays generic backend traps unrelated to any one system; do not move them into a system folder.
 
-Folder: `systems/<system-slug>/README.md` (week plan, table of days) + one folder per day. Day 1 (the design episode) and the last-day rollup have no bug/fix — just `README.md`; tooling only treats folders with an `episode.ts` as traps. `npm run shortener:all` runs every trap's bug and fix and prints a scoreboard. Each bug day follows the same contract as a numbered episode (`bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts`, `README.md`, `trace.json`), just nested under the system folder instead of at root. npm scripts for a system use the system name as prefix and take the day slug (`npm run shortener:bug -- id-collision`, via `systems/url-shortener/run.ts`), added to package.json as each day's trap ships — don't add placeholder scripts for traps that don't exist yet, and don't create a trap folder's code files until that day's episode is actually written (an incomplete `proof.test.ts` breaks `npm test`'s glob).
+Folder: `systems/<system-slug>/README.md` (week plan, table of days) + one folder per day. Day 1 (the design episode) and the last-day rollup have no bug/fix — just `README.md`; tooling only treats folders with an `episode.ts` as traps. `npm run <prefix>:all` runs every trap's bug and fix and prints a scoreboard. Traps with no database (e.g. rate limiter, Redis only) skip `warmPool`. Each bug day follows the same contract as a numbered episode (`bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts`, `README.md`, `trace.json`), just nested under the system folder instead of at root. npm scripts for a system use a short prefix and take the day slug (`npm run shortener:bug -- id-collision`, `npm run limiter:bug -- counter-race`), added to package.json when a system's first trap ships (each `systems/<name>/run.ts` is a two-line call to `shared/run-system.ts`) — don't add placeholder scripts for traps that don't exist yet, and don't create a trap folder's code files until that day's episode is actually written (an incomplete `proof.test.ts` breaks `npm test`'s glob).
 
 ## Commands
 
 - `npm run db:up` (Docker) or set `DATABASE_URL`
 - `npm test`, `npm run typecheck`
 - `npm run trace [NN | path-fragment]` regenerates trace.json from a real run (`npm run trace -- 01`, `npm run trace -- systems/url-shortener`, `npm run trace -- click-counter`). Always run after changing bug/fix.
-- `npm test` runs `*/proof.test.ts` and `systems/*/*/proof.test.ts`.
+- `npm test` runs `*/proof.test.ts` and `systems/*/*/proof.test.ts`, one file at a time (`--test-concurrency=1`): timing-calibrated traps must not share Postgres with other tests mid-run.
 
 ## Trace format
 

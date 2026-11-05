@@ -35,6 +35,18 @@ export class FakeRedis {
     return next;
   }
 
+  /**
+   * INCR that sets the TTL when it creates the key, in one step.
+   * In real Redis this is a small Lua script (or MULTI/EXEC): atomic, so the key can never
+   * exist without its expiry.
+   */
+  incrWithExpiry(key: string, ttlSeconds: number): number {
+    const existing = this.live(key);
+    const next = Number(existing?.value ?? 0) + 1;
+    this.data.set(key, { value: next, expiresAt: existing?.expiresAt ?? Date.now() + ttlSeconds * 1000 });
+    return next;
+  }
+
   getdel(key: string): string | number | null {
     const v = this.get(key);
     this.data.delete(key);
