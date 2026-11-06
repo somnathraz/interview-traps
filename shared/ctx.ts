@@ -19,7 +19,11 @@ export interface Ctx {
     /** INCR + set TTL on first hit, atomically (a Lua script in real Redis). */
     incrWithExpiry(key: string, ttlSeconds: number): Promise<number>;
     getdel(key: string): Promise<number>;
+    /** Token bucket check-and-spend, atomically (Stripe's Lua script). True if a token was taken. */
+    takeToken(key: string, capacity: number, refillPerSecond: number, nowMs: number): Promise<boolean>;
   };
+  /** Current time in ms. Episodes can pin it (window-boundary traps need exact timestamps). */
+  now(): number;
   chargePayment(userId: string): Promise<void>;
   respond<S extends string>(status: S): S;
 }
@@ -34,6 +38,8 @@ export interface CtxOptions {
   redis?: FakeRedis;
   /** how a response should be coloured in the replay. Default: CONFIRMED = ok, anything else = warn. */
   judge?: (status: string) => Severity | undefined;
+  /** what ctx.now() returns. Default: the real clock. */
+  clock?: () => number;
 }
 
 const compact = (sql: string) => sql.replace(/\s+/g, " ").trim();
@@ -54,6 +60,7 @@ export function makeCtx({
   paymentMs = 80,
   redis = new FakeRedis(),
   judge = defaultJudge,
+  clock = Date.now,
 }: CtxOptions): Ctx {
   const show = (v: unknown) => (v === null ? "nil" : typeof v === "string" ? `'${v}'` : String(v));
   // snapshot after cache writes so the replay shows the keyspace change. INCR opts out: its label
@@ -92,6 +99,16 @@ export function makeCtx({
           "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
         );
         return n;
+      },
+      async takeToken(key, capacity, refillPerSecond, nowMs) {
+        const { allowed, tokens } = redis.takeToken(key, capacity, refillPerSecond, nowMs);
+        await cacheEvent(
+          "write",
+          `TAKE ${key} → ${allowed ? "token taken" : "empty"} (${tokens.toFixed(2)} left of ${capacity})`,
+          "ctx.redis.takeToken",
+          "Refill by elapsed time, then take one token, in one atomic step (a Lua script in real Redis).",
+        );
+        return allowed;
       },
       async getdel(key) {
         const v = Number(redis.getdel(key) ?? 0);
@@ -134,6 +151,8 @@ export function makeCtx({
         return res;
       },
     },
+
+    now: () => clock(),
 
     async chargePayment(userId) {
       await tracer.event({

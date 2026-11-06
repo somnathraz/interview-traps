@@ -1,0 +1,367 @@
+{
+  "schemaVersion": 1,
+  "slug": "rate-limiter-window-burst",
+  "number": 3,
+  "title": "The window boundary burst",
+  "question": "Your limiter allows 100 requests per minute with a counter per calendar minute. A client sends 100 at 0:59.9 and 100 more at 1:00.1. How many get through in that 0.2 seconds?",
+  "why": "A fixed window resets at the top of every minute. The first burst uses up minute 0's counter, the second lands in a brand-new minute 1 counter. Each window is within its limit; together they are 2× the limit in 0.2 seconds.",
+  "rule": "A fixed window bounds requests per calendar minute, not per any 60 seconds. If bursts at the boundary matter, use a token bucket (what Stripe uses) or a sliding window, and say the trade-off.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/rate-limiter/02-window-burst",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "req1",
+      "label": "Request 1",
+      "kind": "client"
+    },
+    {
+      "id": "req2",
+      "label": "Request 2",
+      "kind": "client"
+    },
+    {
+      "id": "req3",
+      "label": "Request 3",
+      "kind": "client"
+    },
+    {
+      "id": "req4",
+      "label": "Request 4",
+      "kind": "client"
+    },
+    {
+      "id": "redis",
+      "label": "Redis",
+      "kind": "cache"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Fixed window (counter per minute)",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: fixed window. One counter per calendar minute.\n * The count is atomic (no race), but the window resets at :00.\n * A full limit at 0:59.9 plus a full limit at 1:00.1 = 2× the limit in 0.2 seconds.\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limitPerMinute: number) {\n  // step: window\n  const minute = Math.floor(ctx.now() / 60_000);\n  const key = `rl:${apiKey}:${minute}`;\n\n  // step: count\n  const count = await ctx.redis.incrWithExpiry(key, 60);\n\n  // step: check\n  if (count > limitPerMinute) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "window": [
+          9,
+          11
+        ],
+        "count": [
+          13,
+          14
+        ],
+        "check": [
+          16,
+          19
+        ],
+        "allow": [
+          21,
+          22
+        ]
+      },
+      "initialState": {
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 0.2,
+          "actor": "req1",
+          "type": "request",
+          "label": "0:59.9  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.2,
+          "actor": "req2",
+          "type": "request",
+          "label": "0:59.9  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.4,
+          "actor": "req1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1:29999999 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1:29999999",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.5,
+          "actor": "req2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1:29999999 → 2 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1:29999999",
+                "value": 2,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.5,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.5,
+          "actor": "req2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.5,
+          "actor": "req3",
+          "type": "request",
+          "label": "1:00.1  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.6,
+          "actor": "req4",
+          "type": "request",
+          "label": "1:00.1  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.6,
+          "actor": "req3",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1:30000000 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1:29999999",
+                "value": 2,
+                "ttl_s": 60
+              },
+              {
+                "key": "rl:user1:30000000",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 7.3,
+          "actor": "req4",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1:30000000 → 2 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "redis": [
+              {
+                "key": "rl:user1:29999999",
+                "value": 2,
+                "ttl_s": 60
+              },
+              {
+                "key": "rl:user1:30000000",
+                "value": 2,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 7.4,
+          "actor": "req3",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 7.4,
+          "actor": "req4",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Limit 2/min, 4 requests got through in 0.2 seconds (2 at 0:59.9 + 2 at 1:00.1)."
+      }
+    },
+    "fix": {
+      "label": "Token bucket",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: token bucket, like Stripe. No calendar boundary to exploit.\n * The bucket holds `limit` tokens and refills continuously at limit/60 per second.\n * A burst can empty it once; after that you get tokens only as fast as they drip back.\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limitPerMinute: number) {\n  // step: take\n  const allowed = await ctx.redis.takeToken(`tb:${apiKey}`, limitPerMinute, limitPerMinute / 60, ctx.now());\n\n  // step: check\n  if (!allowed) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "take": [
+          9,
+          10
+        ],
+        "check": [
+          12,
+          15
+        ],
+        "allow": [
+          17,
+          18
+        ]
+      },
+      "initialState": {
+        "redis": []
+      },
+      "events": [
+        {
+          "t": 0,
+          "actor": "req1",
+          "type": "request",
+          "label": "0:59.9  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0,
+          "actor": "req2",
+          "type": "request",
+          "label": "0:59.9  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.2,
+          "actor": "req1",
+          "target": "redis",
+          "type": "write",
+          "label": "TAKE tb:user1 → token taken (1.00 left of 2)",
+          "detail": "Refill by elapsed time, then take one token, in one atomic step (a Lua script in real Redis).",
+          "state": {
+            "redis": [
+              {
+                "key": "tb:user1",
+                "value": "{\"tokens\":1,\"ts\":1799999999900}",
+                "ttl_s": 120
+              }
+            ]
+          },
+          "step": "take"
+        },
+        {
+          "t": 0.2,
+          "actor": "req2",
+          "target": "redis",
+          "type": "write",
+          "label": "TAKE tb:user1 → token taken (0.00 left of 2)",
+          "detail": "Refill by elapsed time, then take one token, in one atomic step (a Lua script in real Redis).",
+          "state": {
+            "redis": [
+              {
+                "key": "tb:user1",
+                "value": "{\"tokens\":0,\"ts\":1799999999900}",
+                "ttl_s": 120
+              }
+            ]
+          },
+          "step": "take"
+        },
+        {
+          "t": 0.3,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.3,
+          "actor": "req2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.3,
+          "actor": "req3",
+          "type": "request",
+          "label": "1:00.1  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.3,
+          "actor": "req4",
+          "type": "request",
+          "label": "1:00.1  GET /v1/charges (limit 2/min)"
+        },
+        {
+          "t": 0.3,
+          "actor": "req3",
+          "target": "redis",
+          "type": "write",
+          "label": "TAKE tb:user1 → empty (0.01 left of 2)",
+          "detail": "Refill by elapsed time, then take one token, in one atomic step (a Lua script in real Redis).",
+          "state": {
+            "redis": [
+              {
+                "key": "tb:user1",
+                "value": "{\"tokens\":0.006666666666666667,\"ts\":1800000000100}",
+                "ttl_s": 120
+              }
+            ]
+          },
+          "step": "take"
+        },
+        {
+          "t": 0.3,
+          "actor": "req4",
+          "target": "redis",
+          "type": "write",
+          "label": "TAKE tb:user1 → empty (0.01 left of 2)",
+          "detail": "Refill by elapsed time, then take one token, in one atomic step (a Lua script in real Redis).",
+          "state": {
+            "redis": [
+              {
+                "key": "tb:user1",
+                "value": "{\"tokens\":0.006666666666666667,\"ts\":1800000000100}",
+                "ttl_s": 120
+              }
+            ]
+          },
+          "step": "take"
+        },
+        {
+          "t": 0.3,
+          "actor": "req3",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        },
+        {
+          "t": 0.3,
+          "actor": "req4",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "Limit 2/min: 2 got through in 0.2 seconds (2 at 0:59.9, 0 at 1:00.1). The rest got 429."
+      }
+    }
+  },
+  "generatedAt": "2026-11-06T07:18:20.450Z"
+}

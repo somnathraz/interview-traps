@@ -47,6 +47,22 @@ export class FakeRedis {
     return next;
   }
 
+  /**
+   * Token bucket check-and-spend in one step, like Stripe's Lua script: refill by elapsed time,
+   * take a token if there is one. Atomic, so concurrent requests can't spend the same token.
+   */
+  takeToken(key: string, capacity: number, refillPerSecond: number, nowMs: number): { allowed: boolean; tokens: number } {
+    const saved = this.live(key)?.value;
+    const state = typeof saved === "string" ? (JSON.parse(saved) as { tokens: number; ts: number }) : { tokens: capacity, ts: nowMs };
+    const elapsed = Math.max(0, nowMs - state.ts) / 1000;
+    let tokens = Math.min(capacity, state.tokens + elapsed * refillPerSecond);
+    const allowed = tokens >= 1;
+    if (allowed) tokens -= 1;
+    const ttl = Math.ceil((capacity / refillPerSecond) * 2); // a full refill, twice over, then forget the user
+    this.data.set(key, { value: JSON.stringify({ tokens, ts: nowMs }), expiresAt: Date.now() + ttl * 1000 });
+    return { allowed, tokens };
+  }
+
   getdel(key: string): string | number | null {
     const v = this.get(key);
     this.data.delete(key);

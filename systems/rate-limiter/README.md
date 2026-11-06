@@ -23,7 +23,7 @@ The request rate limiter is a **token bucket in Redis**, and the check-and-spend
 |---|---|---|---|
 | 1 | Core design | Stripe's four limiters; fixed window vs sliding window vs token bucket | [design notes](./00-core-design) |
 | 2 | The counter race | `GET` the count, check, `SET` count + 1: limit 10, 50 requests get in | [trap](./01-counter-race) · `npm run limiter:bug -- counter-race` |
-| 3 | The window boundary burst | Fixed window: 10 at 0:59 + 10 at 1:00 = 20 in one second | coming |
+| 3 | The window boundary burst | Fixed window: 100 at 0:59.9 + 100 at 1:00.1 = 200 in 0.2s | [trap](./02-window-burst) · `npm run limiter:bug -- window-burst --users 200` |
 | 4 | One limiter per server | In-memory limiter behind a load balancer: 4 servers = 4× the limit | coming |
 | 5 | The key that never expires | `INCR` then `EXPIRE` as two calls: crash in between, user blocked forever | coming |
 | 6 | Redis goes down, API goes down | A fail-closed limiter turns a cache outage into a full outage | coming |
