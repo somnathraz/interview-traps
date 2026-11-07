@@ -30,7 +30,7 @@ Instead of one isolated trap, a system gets a full week: the design decision on 
 | System | Days | Status |
 |---|---|---|
 | [URL Shortener](./systems/url-shortener) | Core design → [ID collision](./systems/url-shortener/01-id-collision) → [stale redirect](./systems/url-shortener/02-stale-redirect) → [analytics on the hot path](./systems/url-shortener/03-click-counter) → [vanity alias race](./systems/url-shortener/04-vanity-alias-race) → [cleanup at scale](./systems/url-shortener/05-cleanup-at-scale) → [rollup](./systems/url-shortener/06-rollup) | complete · `npm run shortener:all` |
-| [Rate Limiter](./systems/rate-limiter) · how Stripe does it | Core design (Stripe's four limiters, token bucket) → [counter race](./systems/rate-limiter/01-counter-race) → [window boundary burst](./systems/rate-limiter/02-window-burst) → one limiter per server → key that never expires → Redis down, API down → rollup | in progress |
+| [Rate Limiter](./systems/rate-limiter) · how Stripe does it | Core design (Stripe's four limiters, token bucket) → [counter race](./systems/rate-limiter/01-counter-race) → [window boundary burst](./systems/rate-limiter/02-window-burst) → [one limiter per server](./systems/rate-limiter/03-limiter-per-server) → key that never expires → Redis down, API down → rollup | in progress |
 
 Each system starts from how a real company built it. See [`systems/rate-limiter/README.md`](./systems/rate-limiter/README.md) for this week's plan. Systems live in `systems/<name>/`, independent of the numbered episodes above.
 

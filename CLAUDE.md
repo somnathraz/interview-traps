@@ -7,7 +7,7 @@ Runnable backend interview traps. Each episode pairs with a reel (tech-instagram
 Folder `NN-slug/` with exactly: `bug.ts`, `fix.ts`, `episode.ts`, `proof.test.ts`, `README.md`, `trace.json` (generated), plus `schema.sql` if it uses Postgres.
 
 - `bug.ts` / `fix.ts` export the same function signature taking `ctx: Ctx` first. Only touch the outside world through `ctx` (`ctx.db.query`, `ctx.redis.*`, `ctx.chargePayment`, `ctx.respond`, add new traced helpers to `shared/ctx.ts`). No tracing calls in episode code.
-- `ctx.redis` is backed by `shared/kv.ts` (in-process, Redis semantics). Create one `FakeRedis` per run in `episode.ts` and pass it to every user's `makeCtx`. Use `makeCtx({ judge })` to colour responses in the replay, and `exclusiveSuccess: false` on the episode when many users can legitimately succeed.
+- `ctx.redis` is backed by `shared/kv.ts` (in-process, Redis semantics). Create one `FakeRedis` per run in `episode.ts` and pass it to every user's `makeCtx`. `ctx.memory` is the same API backed by a per-server store (pass `memory` + `memoryTarget` per simulated server) for "state lives in one process" traps. `ctx.now()` is pinnable via `makeCtx({ clock })`. Use `makeCtx({ judge })` to colour responses in the replay, and `exclusiveSuccess: false` on the episode when many users can legitimately succeed.
 - Mark blocks with `// step: <name>` comments. Keep each file under ~50 lines. It's shown on screen in the replay.
 - Write the bug the way a reasonable mid-level dev would. No strawmen.
 - `episode.ts` exports `episode: Episode` (see `shared/episode.ts`). `traceUsers` = 2-3 short names.

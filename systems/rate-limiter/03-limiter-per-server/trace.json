@@ -1,0 +1,417 @@
+{
+  "schemaVersion": 1,
+  "slug": "rate-limiter-limiter-per-server",
+  "number": 4,
+  "title": "One limiter per server",
+  "question": "Your limiter allows 100 requests a minute and works perfectly in testing. In production there are 4 API servers behind a load balancer. One user sends 400 requests. How many get through?",
+  "why": "Each server keeps its count in its own memory and only sees the requests the load balancer sends it. Round-robin gives each server 100, each server's counter says 100, nobody's limit is crossed. The user gets the limit once per server: 4×.",
+  "rule": "A limit is only as global as the place its count lives. Keep counters in one shared store (Redis) that every server reads and writes, or the limit silently multiplies by the number of servers.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/rate-limiter/03-limiter-per-server",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "req1",
+      "label": "Request 1",
+      "kind": "client"
+    },
+    {
+      "id": "req2",
+      "label": "Request 2",
+      "kind": "client"
+    },
+    {
+      "id": "req3",
+      "label": "Request 3",
+      "kind": "client"
+    },
+    {
+      "id": "req4",
+      "label": "Request 4",
+      "kind": "client"
+    },
+    {
+      "id": "mem-api-1",
+      "label": "api-1 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "mem-api-2",
+      "label": "api-2 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "mem-api-3",
+      "label": "api-3 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "mem-api-4",
+      "label": "api-4 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "redis",
+      "label": "Redis (shared)",
+      "kind": "cache"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Counter in each server's memory",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * BUG: the count lives in this server's own memory.\n * Works perfectly on one server. Behind a load balancer with 4 servers,\n * each one counts only the requests it sees: the user gets the limit 4 times.\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limit: number) {\n  // step: count\n  const count = await ctx.memory.incrWithExpiry(`rl:${apiKey}`, 60);\n\n  // step: check\n  if (count > limit) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "count": [
+          9,
+          10
+        ],
+        "check": [
+          12,
+          15
+        ],
+        "allow": [
+          17,
+          18
+        ]
+      },
+      "initialState": {
+        "counters": []
+      },
+      "events": [
+        {
+          "t": 0.2,
+          "actor": "req1",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-1"
+        },
+        {
+          "t": 0.2,
+          "actor": "req2",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-2"
+        },
+        {
+          "t": 0.2,
+          "actor": "req3",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-3"
+        },
+        {
+          "t": 0.2,
+          "actor": "req4",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-4"
+        },
+        {
+          "t": 0.4,
+          "actor": "req1",
+          "target": "mem-api-1",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "api-1 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.5,
+          "actor": "req2",
+          "target": "mem-api-2",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "api-1 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-2 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.7,
+          "actor": "req3",
+          "target": "mem-api-3",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "api-1 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-2 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-3 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.7,
+          "actor": "req4",
+          "target": "mem-api-4",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "api-1 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-2 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-3 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-4 memory",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.8,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.8,
+          "actor": "req2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.8,
+          "actor": "req3",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.8,
+          "actor": "req4",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Limit 1/min, 4 of 4 got through: the limit once per server, ×4."
+      }
+    },
+    "fix": {
+      "label": "Counter in shared Redis",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\n/**\n * FIX: one shared store for every server. Same code, different place for the count.\n * Every API server INCRs the same Redis key, so the limit holds no matter\n * which server the load balancer picks. (Stripe keeps its buckets in Redis.)\n */\nexport async function allowRequest(ctx: Ctx, apiKey: string, limit: number) {\n  // step: count\n  const count = await ctx.redis.incrWithExpiry(`rl:${apiKey}`, 60);\n\n  // step: check\n  if (count > limit) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: allow\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "count": [
+          9,
+          10
+        ],
+        "check": [
+          12,
+          15
+        ],
+        "allow": [
+          17,
+          18
+        ]
+      },
+      "initialState": {
+        "counters": []
+      },
+      "events": [
+        {
+          "t": 0,
+          "actor": "req1",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-1"
+        },
+        {
+          "t": 0,
+          "actor": "req2",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-2"
+        },
+        {
+          "t": 0,
+          "actor": "req3",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-3"
+        },
+        {
+          "t": 0,
+          "actor": "req4",
+          "type": "request",
+          "label": "GET /v1/charges → load balancer → api-4"
+        },
+        {
+          "t": 0.1,
+          "actor": "req1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis (shared)",
+                "key": "rl:user1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.1,
+          "actor": "req2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 2 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis (shared)",
+                "key": "rl:user1",
+                "value": 2,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "req3",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 3 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis (shared)",
+                "key": "rl:user1",
+                "value": 3,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "req4",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:user1 → 4 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis (shared)",
+                "key": "rl:user1",
+                "value": 4,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "req1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "allow"
+        },
+        {
+          "t": 0.2,
+          "actor": "req2",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        },
+        {
+          "t": 0.2,
+          "actor": "req3",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        },
+        {
+          "t": 0.2,
+          "actor": "req4",
+          "type": "response",
+          "label": "429 Too Many Requests",
+          "severity": "warn",
+          "step": "check"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "Limit 1/min across 4 servers: exactly 1 of 4 got through, the rest got 429."
+      }
+    }
+  },
+  "generatedAt": "2026-11-07T06:28:12.745Z"
+}
