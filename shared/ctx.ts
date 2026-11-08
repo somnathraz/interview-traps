@@ -16,6 +16,8 @@ export interface Ctx {
     set(key: string, value: string | number, opts?: { ttlSeconds?: number }): Promise<void>;
     del(key: string): Promise<number>;
     incr(key: string): Promise<number>;
+    /** Set a TTL on an existing key, as its own separate call. */
+    expire(key: string, ttlSeconds: number): Promise<number>;
     /** INCR + set TTL on first hit, atomically (a Lua script in real Redis). */
     incrWithExpiry(key: string, ttlSeconds: number): Promise<number>;
     getdel(key: string): Promise<number>;
@@ -31,6 +33,7 @@ export interface Ctx {
     set(key: string, value: string | number, opts?: { ttlSeconds?: number }): Promise<void>;
     del(key: string): Promise<number>;
     incr(key: string): Promise<number>;
+    expire(key: string, ttlSeconds: number): Promise<number>;
     incrWithExpiry(key: string, ttlSeconds: number): Promise<number>;
     getdel(key: string): Promise<number>;
     takeToken(key: string, capacity: number, refillPerSecond: number, nowMs: number): Promise<boolean>;
@@ -57,6 +60,11 @@ export interface CtxOptions {
   memory?: FakeRedis;
   /** actor id that ctx.memory events point at in the replay, e.g. "mem-api-1". */
   memoryTarget?: string;
+  /**
+   * Fault injection: the process dies after this many Redis calls in this request
+   * (a deploy rolling the pod, an OOM kill). The next call throws instead of running.
+   */
+  crashAfterCalls?: number;
 }
 
 const compact = (sql: string) => sql.replace(/\s+/g, " ").trim();
@@ -73,35 +81,74 @@ const defaultJudge = (status: string): Severity => (status === "CONFIRMED" ? "ok
 type KvClient = Ctx["redis"];
 
 /** A Redis-shaped client over a FakeRedis, tracing every call against `target`. */
-function kvClient(store: FakeRedis, tracer: Tracer, actor: string, target: string, name: string): KvClient {
+export class ProcessKilled extends Error {
+  constructor() {
+    super("process killed mid-request (deploy rolled the pod)");
+  }
+}
+
+function kvClient(
+  store: FakeRedis,
+  tracer: Tracer,
+  actor: string,
+  target: string,
+  name: string,
+  calls: { n: number; crashAfter?: number } = { n: 0 },
+): KvClient {
   const show = (v: unknown) => (v === null ? "nil" : typeof v === "string" ? `'${v}'` : String(v));
   // snapshot after writes so the replay shows the keyspace change. INCR opts out: its label
   // already carries the new value, and a DB round trip per click would make the replay lie about speed.
   const event = (type: "read" | "write", label: string, method: string, detail?: string, snapshot = type === "write") =>
     tracer.event({ actor, target, type, label, anchor: `${name}.${method}`, detail }, { snapshot });
+  // fault injection: once the request has made `crashAfter` calls, the process is gone
+  const guard = async (method: string) => {
+    if (calls.crashAfter !== undefined && calls.n >= calls.crashAfter) {
+      await tracer.event({
+        actor,
+        type: "note",
+        label: `💥 process killed before ${name}.${method}()`,
+        detail: "A deploy rolled the pod (or the OOM killer struck) between two Redis calls. Whatever came next never ran.",
+        anchor: `${name}.${method}`,
+        severity: "bad",
+      });
+      throw new ProcessKilled();
+    }
+    calls.n++;
+  };
 
   return {
     async get(key) {
+      await guard("get");
       const v = store.get(key);
       await event("read", `GET ${key} → ${v === null ? "miss" : show(v)}`, "get");
       return v === null ? null : String(v);
     },
     async set(key, value, opts = {}) {
+      await guard("set");
       store.set(key, value, opts.ttlSeconds);
       const ttl = opts.ttlSeconds ? ` (expires in ${opts.ttlSeconds}s)` : "";
       await event("write", `SET ${key} = ${show(value)}${ttl}`, "set");
     },
     async del(key) {
+      await guard("del");
       const n = store.del(key);
       await event("write", `DEL ${key} → ${n} key${n === 1 ? "" : "s"} removed`, "del");
       return n;
     },
     async incr(key) {
+      await guard("incr");
       const n = store.incr(key);
       await event("write", `INCR ${key} → ${n}`, "incr", "Atomic in-memory increment. No row lock, no disk.", false);
       return n;
     },
+    async expire(key, ttlSeconds) {
+      await guard("expire");
+      const n = store.expire(key, ttlSeconds);
+      await event("write", `EXPIRE ${key} ${ttlSeconds} → ${n === 1 ? "TTL set" : "no such key"}`, "expire");
+      return n;
+    },
     async incrWithExpiry(key, ttlSeconds) {
+      await guard("incrWithExpiry");
       const n = store.incrWithExpiry(key, ttlSeconds);
       await event(
         "write",
@@ -112,6 +159,7 @@ function kvClient(store: FakeRedis, tracer: Tracer, actor: string, target: strin
       return n;
     },
     async takeToken(key, capacity, refillPerSecond, nowMs) {
+      await guard("takeToken");
       const { allowed, tokens } = store.takeToken(key, capacity, refillPerSecond, nowMs);
       await event(
         "write",
@@ -122,6 +170,7 @@ function kvClient(store: FakeRedis, tracer: Tracer, actor: string, target: strin
       return allowed;
     },
     async getdel(key) {
+      await guard("getdel");
       const v = Number(store.getdel(key) ?? 0);
       await event("write", `GETDEL ${key} → ${v}`, "getdel", "Read the count and reset it in one step.");
       return v;
@@ -139,8 +188,10 @@ export function makeCtx({
   clock = Date.now,
   memory,
   memoryTarget = "memory",
+  crashAfterCalls,
 }: CtxOptions): Ctx {
-  const redisClient = kvClient(redis, tracer, actor, "redis", "ctx.redis");
+  const calls = { n: 0, crashAfter: crashAfterCalls };
+  const redisClient = kvClient(redis, tracer, actor, "redis", "ctx.redis", calls);
   // a server's own process memory: only that server can see it
   const memoryClient = kvClient(memory ?? new FakeRedis(), tracer, actor, memoryTarget, "ctx.memory");
 

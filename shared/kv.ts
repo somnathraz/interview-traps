@@ -8,9 +8,12 @@ type Entry = { value: string | number; expiresAt?: number };
 export class FakeRedis {
   private readonly data = new Map<string, Entry>();
 
+  /** `now` drives TTLs. Pass a fake clock to fast-forward minutes in a test. */
+  constructor(private readonly now: () => number = Date.now) {}
+
   private live(key: string): Entry | undefined {
     const e = this.data.get(key);
-    if (e?.expiresAt !== undefined && e.expiresAt <= Date.now()) {
+    if (e?.expiresAt !== undefined && e.expiresAt <= this.now()) {
       this.data.delete(key);
       return undefined;
     }
@@ -22,7 +25,7 @@ export class FakeRedis {
   }
 
   set(key: string, value: string | number, ttlSeconds?: number) {
-    this.data.set(key, { value, expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined });
+    this.data.set(key, { value, expiresAt: ttlSeconds ? this.now() + ttlSeconds * 1000 : undefined });
   }
 
   del(key: string): number {
@@ -30,8 +33,10 @@ export class FakeRedis {
   }
 
   incr(key: string): number {
-    const next = Number(this.live(key)?.value ?? 0) + 1;
-    this.data.set(key, { value: next });
+    const existing = this.live(key);
+    const next = Number(existing?.value ?? 0) + 1;
+    // like Redis: INCR keeps whatever TTL the key already has
+    this.data.set(key, { value: next, expiresAt: existing?.expiresAt });
     return next;
   }
 
@@ -43,7 +48,7 @@ export class FakeRedis {
   incrWithExpiry(key: string, ttlSeconds: number): number {
     const existing = this.live(key);
     const next = Number(existing?.value ?? 0) + 1;
-    this.data.set(key, { value: next, expiresAt: existing?.expiresAt ?? Date.now() + ttlSeconds * 1000 });
+    this.data.set(key, { value: next, expiresAt: existing?.expiresAt ?? this.now() + ttlSeconds * 1000 });
     return next;
   }
 
@@ -59,8 +64,16 @@ export class FakeRedis {
     const allowed = tokens >= 1;
     if (allowed) tokens -= 1;
     const ttl = Math.ceil((capacity / refillPerSecond) * 2); // a full refill, twice over, then forget the user
-    this.data.set(key, { value: JSON.stringify({ tokens, ts: nowMs }), expiresAt: Date.now() + ttl * 1000 });
+    this.data.set(key, { value: JSON.stringify({ tokens, ts: nowMs }), expiresAt: this.now() + ttl * 1000 });
     return { allowed, tokens };
+  }
+
+  /** Set a TTL on an existing key. 1 if set, 0 if the key doesn't exist. */
+  expire(key: string, ttlSeconds: number): number {
+    const e = this.live(key);
+    if (!e) return 0;
+    e.expiresAt = this.now() + ttlSeconds * 1000;
+    return 1;
   }
 
   getdel(key: string): string | number | null {
@@ -82,7 +95,7 @@ export class FakeRedis {
       .map(({ key, e }) => ({
         key,
         value: e.value,
-        ttl_s: e.expiresAt === undefined ? null : Math.max(0, Math.round((e.expiresAt - Date.now()) / 1000)),
+        ttl_s: e.expiresAt === undefined ? null : Math.max(0, Math.round((e.expiresAt - this.now()) / 1000)),
       }));
   }
 }

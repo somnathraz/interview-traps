@@ -25,7 +25,7 @@ The request rate limiter is a **token bucket in Redis**, and the check-and-spend
 | 2 | The counter race | `GET` the count, check, `SET` count + 1: limit 10, 50 requests get in | [trap](./01-counter-race) · `npm run limiter:bug -- counter-race` |
 | 3 | The window boundary burst | Fixed window: 100 at 0:59.9 + 100 at 1:00.1 = 200 in 0.2s | [trap](./02-window-burst) · `npm run limiter:bug -- window-burst --users 200` |
 | 4 | One limiter per server | In-memory limiter behind a load balancer: limit 100, 4 servers, 400 get in | [trap](./03-limiter-per-server) · `npm run limiter:bug -- per-server --users 400` |
-| 5 | The key that never expires | `INCR` then `EXPIRE` as two calls: crash in between, user blocked forever | coming |
+| 5 | The key that never expires | `INCR` then `EXPIRE` as two calls: a deploy kills the pod in between, user blocked forever at half the limit | [trap](./04-immortal-key) · `npm run limiter:bug -- immortal-key` |
 | 6 | Redis goes down, API goes down | A fail-closed limiter turns a cache outage into a full outage | coming |
 | 7 | Rollup | The whole design, every fix | — |
 
