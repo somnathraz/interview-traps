@@ -65,6 +65,11 @@ export interface CtxOptions {
    * (a deploy rolling the pod, an OOM kill). The next call throws instead of running.
    */
   crashAfterCalls?: number;
+  /**
+   * Fault injection: Redis is unreachable for this request. Every ctx.redis call fails
+   * fast (as if the client's short command timeout fired) and throws RedisUnavailable.
+   */
+  redisDown?: boolean;
 }
 
 const compact = (sql: string) => sql.replace(/\s+/g, " ").trim();
@@ -80,6 +85,12 @@ const defaultJudge = (status: string): Severity => (status === "CONFIRMED" ? "ok
 
 type KvClient = Ctx["redis"];
 
+export class RedisUnavailable extends Error {
+  constructor() {
+    super("Redis unavailable (connection refused / command timed out)");
+  }
+}
+
 /** A Redis-shaped client over a FakeRedis, tracing every call against `target`. */
 export class ProcessKilled extends Error {
   constructor() {
@@ -93,7 +104,7 @@ function kvClient(
   actor: string,
   target: string,
   name: string,
-  calls: { n: number; crashAfter?: number } = { n: 0 },
+  calls: { n: number; crashAfter?: number; down?: boolean } = { n: 0 },
 ): KvClient {
   const show = (v: unknown) => (v === null ? "nil" : typeof v === "string" ? `'${v}'` : String(v));
   // snapshot after writes so the replay shows the keyspace change. INCR opts out: its label
@@ -102,6 +113,18 @@ function kvClient(
     tracer.event({ actor, target, type, label, anchor: `${name}.${method}`, detail }, { snapshot });
   // fault injection: once the request has made `crashAfter` calls, the process is gone
   const guard = async (method: string) => {
+    if (calls.down) {
+      await tracer.event({
+        actor,
+        target,
+        type: "read",
+        label: `${name}.${method}() → ERROR: Redis unavailable`,
+        detail: "Connection refused, or the command hit its timeout. The call never reached the data.",
+        anchor: `${name}.${method}`,
+        severity: "bad",
+      });
+      throw new RedisUnavailable();
+    }
     if (calls.crashAfter !== undefined && calls.n >= calls.crashAfter) {
       await tracer.event({
         actor,
@@ -189,8 +212,9 @@ export function makeCtx({
   memory,
   memoryTarget = "memory",
   crashAfterCalls,
+  redisDown,
 }: CtxOptions): Ctx {
-  const calls = { n: 0, crashAfter: crashAfterCalls };
+  const calls = { n: 0, crashAfter: crashAfterCalls, down: redisDown };
   const redisClient = kvClient(redis, tracer, actor, "redis", "ctx.redis", calls);
   // a server's own process memory: only that server can see it
   const memoryClient = kvClient(memory ?? new FakeRedis(), tracer, actor, memoryTarget, "ctx.memory");

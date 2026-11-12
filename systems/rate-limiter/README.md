@@ -26,7 +26,7 @@ The request rate limiter is a **token bucket in Redis**, and the check-and-spend
 | 3 | The window boundary burst | Fixed window: 100 at 0:59.9 + 100 at 1:00.1 = 200 in 0.2s | [trap](./02-window-burst) · `npm run limiter:bug -- window-burst --users 200` |
 | 4 | One limiter per server | In-memory limiter behind a load balancer: limit 100, 4 servers, 400 get in | [trap](./03-limiter-per-server) · `npm run limiter:bug -- per-server --users 400` |
 | 5 | The key that never expires | `INCR` then `EXPIRE` as two calls: a deploy kills the pod in between, user blocked forever at half the limit | [trap](./04-immortal-key) · `npm run limiter:bug -- immortal-key` |
-| 6 | Redis goes down, API goes down | A fail-closed limiter turns a cache outage into a full outage | coming |
-| 7 | Rollup | The whole design, every fix | — |
+| 6 | Redis goes down, API goes down | Limiter awaits Redis with no plan B: Redis down, every endpoint 500s | [trap](./05-redis-down) · `npm run limiter:bug -- redis-down` |
+| 7 | Rollup | The whole design, every trap fixed, `npm run limiter:all` | [rollup](./06-rollup) |
 
 Run any day with `npm run limiter:bug -- <day>` / `limiter:fix`, or every trap at once with `npm run limiter:all`. Traps land with each day's reel and follow the same contract as the rest of the repo (see [`../../CLAUDE.md`](../../CLAUDE.md)). Redis is [`shared/kv.ts`](../../shared/kv.ts), the in-process stand-in, so this week runs with nothing but Node.

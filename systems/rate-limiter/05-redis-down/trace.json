@@ -1,0 +1,721 @@
+{
+  "schemaVersion": 1,
+  "slug": "rate-limiter-redis-down",
+  "number": 6,
+  "title": "Redis goes down, API goes down",
+  "question": "Your rate limiter keeps its counters in Redis. Redis goes down for a minute. The database is fine, the servers are fine. What happens to your API?",
+  "why": "Every request asks the limiter first, and the limiter awaits Redis with no plan B. The call throws, the error handler returns 500, and the whole API is down, including endpoints that only read from the healthy database. The limiter became a single point of failure for everything behind it.",
+  "rule": "Decide per endpoint what happens when the limiter can't answer, before it happens. Cheap reads fail open to a conservative local limit, costly or abusable actions fail closed with a 503, and the limiter call gets a short timeout so an outage fails fast instead of hanging.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/rate-limiter/05-redis-down",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "shopper1",
+      "label": "Shopper 1",
+      "kind": "client"
+    },
+    {
+      "id": "shopper2",
+      "label": "Shopper 2",
+      "kind": "client"
+    },
+    {
+      "id": "mem-api-1",
+      "label": "api-1 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "mem-api-2",
+      "label": "api-2 memory",
+      "kind": "cache"
+    },
+    {
+      "id": "redis",
+      "label": "Redis",
+      "kind": "cache"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "Limiter awaits Redis, no plan B",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\nexport type Endpoint = \"GET /catalog\" | \"POST /otp/send\";\nexport const LIMITS: Record<Endpoint, number> = { \"GET /catalog\": 20, \"POST /otp/send\": 3 }; // per user per minute\n\n/**\n * BUG: the limiter awaits Redis with no plan for Redis being gone.\n * When Redis is down the call throws, the error handler turns it into a 500,\n * and every endpoint behind the limiter goes down with it, even the ones\n * that only read from a perfectly healthy database.\n */\nexport async function handle(ctx: Ctx, userId: string, endpoint: Endpoint) {\n  const key = `rl:${endpoint}:${userId}`;\n\n  // step: count\n  const count = await ctx.redis.incrWithExpiry(key, 60); // atomic, TTL set: days 2-5 done right\n\n  // step: check\n  if (count > LIMITS[endpoint]) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: serve\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "count": [
+          15,
+          16
+        ],
+        "check": [
+          18,
+          21
+        ],
+        "serve": [
+          23,
+          24
+        ]
+      },
+      "initialState": {
+        "counters": []
+      },
+      "events": [
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis healthy: GET /catalog → api-1"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis healthy: POST /otp/send → api-1"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis healthy: GET /catalog → api-2"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis healthy: POST /otp/send → api-2"
+        },
+        {
+          "t": 1.9,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 2,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:POST /otp/send:shopper1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 8,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper2 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 8,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:POST /otp/send:shopper2 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis down: GET /catalog → api-1"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis down: POST /otp/send → api-1"
+        },
+        {
+          "t": 8.2,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis down: GET /catalog → api-2"
+        },
+        {
+          "t": 8.3,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis down: POST /otp/send → api-2"
+        },
+        {
+          "t": 8.3,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 8.3,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 8.3,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 8.3,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 8.4,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "500 Internal Server Error",
+          "detail": "The limiter threw. The framework's error handler turned it into a 500.",
+          "severity": "bad"
+        },
+        {
+          "t": 8.4,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "500 Internal Server Error",
+          "detail": "The limiter threw. The framework's error handler turned it into a 500.",
+          "severity": "bad"
+        },
+        {
+          "t": 8.4,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "500 Internal Server Error",
+          "detail": "The limiter threw. The framework's error handler turned it into a 500.",
+          "severity": "bad"
+        },
+        {
+          "t": 8.4,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "500 Internal Server Error",
+          "detail": "The limiter threw. The framework's error handler turned it into a 500.",
+          "severity": "bad"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "Redis down, database healthy: 4 of 4 requests failed with 500, catalog reads included. The rate limiter took the whole API down."
+      }
+    },
+    "fix": {
+      "label": "Per-endpoint policy: local fallback or 503",
+      "source": "import { RedisUnavailable, type Ctx } from \"../../../shared/ctx.ts\";\nimport { LIMITS, type Endpoint } from \"./bug.ts\";\n\nexport const SERVERS = 2;\n/** Decided per endpoint, ahead of time: what happens when the limiter can't answer. */\nconst IF_LIMITER_DOWN: Record<Endpoint, \"local\" | \"reject\"> = {\n  \"GET /catalog\": \"local\", // cheap read: keep serving, under a stricter per-server cap\n  \"POST /otp/send\": \"reject\", // every request costs an SMS: no real limit, no send\n};\n\n/**\n * FIX: an explicit failure policy per endpoint.\n * The Redis call fails fast (short timeout), then the endpoint's policy decides:\n * catalog reads fall back to an in-process counter at limit / servers,\n * OTP sends get a 503, never an unlimited pass.\n */\nexport async function handle(ctx: Ctx, userId: string, endpoint: Endpoint) {\n  const key = `rl:${endpoint}:${userId}`;\n  let count: number;\n  let limit = LIMITS[endpoint];\n\n  // step: count\n  try {\n    count = await ctx.redis.incrWithExpiry(key, 60);\n  } catch (err) {\n    if (!(err instanceof RedisUnavailable)) throw err;\n    // step: policy\n    if (IF_LIMITER_DOWN[endpoint] === \"reject\") {\n      return ctx.respond(\"503 Service Unavailable (limiter down, retry later)\");\n    }\n    count = await ctx.memory.incrWithExpiry(key, 60); // this server only\n    limit = Math.floor(limit / SERVERS); // so all servers together stay under the real limit\n  }\n\n  // step: check\n  if (count > limit) {\n    return ctx.respond(\"429 Too Many Requests\");\n  }\n\n  // step: serve\n  return ctx.respond(\"200 OK\");\n}\n",
+      "steps": {
+        "count": [
+          22,
+          26
+        ],
+        "policy": [
+          27,
+          33
+        ],
+        "check": [
+          35,
+          38
+        ],
+        "serve": [
+          40,
+          41
+        ]
+      },
+      "initialState": {
+        "counters": []
+      },
+      "events": [
+        {
+          "t": 0,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis healthy: GET /catalog → api-1"
+        },
+        {
+          "t": 0,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis healthy: POST /otp/send → api-1"
+        },
+        {
+          "t": 0,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis healthy: GET /catalog → api-2"
+        },
+        {
+          "t": 0,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis healthy: POST /otp/send → api-2"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:POST /otp/send:shopper1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper2 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "write",
+          "label": "INCR rl:POST /otp/send:shopper2 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "count"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 0.2,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis down: GET /catalog → api-1"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper1",
+          "type": "request",
+          "label": "Redis down: POST /otp/send → api-1"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis down: GET /catalog → api-2"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper2",
+          "type": "request",
+          "label": "Redis down: POST /otp/send → api-2"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper1",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 0.3,
+          "actor": "shopper2",
+          "target": "redis",
+          "type": "read",
+          "label": "ctx.redis.incrWithExpiry() → ERROR: Redis unavailable",
+          "detail": "Connection refused, or the command hit its timeout. The call never reached the data.",
+          "severity": "bad",
+          "step": "count"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "503 Service Unavailable (limiter down, retry later)",
+          "severity": "warn",
+          "step": "policy"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "503 Service Unavailable (limiter down, retry later)",
+          "severity": "warn",
+          "step": "policy"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper1",
+          "target": "mem-api-1",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper1 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-1 memory",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "policy"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper2",
+          "target": "mem-api-2",
+          "type": "write",
+          "label": "INCR rl:GET /catalog:shopper2 → 1 (TTL 60s, same atomic step)",
+          "detail": "Increment and check in one atomic step. Nothing can run between reading the count and writing it.",
+          "state": {
+            "counters": [
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "redis",
+                "key": "rl:POST /otp/send:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-1 memory",
+                "key": "rl:GET /catalog:shopper1",
+                "value": 1,
+                "ttl_s": 60
+              },
+              {
+                "store": "api-2 memory",
+                "key": "rl:GET /catalog:shopper2",
+                "value": 1,
+                "ttl_s": 60
+              }
+            ]
+          },
+          "step": "policy"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper1",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        },
+        {
+          "t": 0.4,
+          "actor": "shopper2",
+          "type": "response",
+          "label": "200 OK",
+          "severity": "ok",
+          "step": "serve"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "Redis down: 2 of 2 catalog reads still served on a local limit; 2 OTP sends refused with 503, 0 SMS sent without a real limit."
+      }
+    }
+  },
+  "generatedAt": "2026-11-12T15:40:05.415Z"
+}
