@@ -1,0 +1,635 @@
+{
+  "schemaVersion": 1,
+  "slug": "payments-idempotency-race",
+  "number": 3,
+  "title": "The idempotency race",
+  "question": "Your payment API checks the idempotency key and returns the stored result for a retry. The app retries while the first request is still at the bank. How many times is the customer charged?",
+  "why": "The key is checked with a SELECT and saved only after the charge. A retry that arrives while the first request is still at the bank finds nothing either, so both pass the check and both charge. ON CONFLICT DO NOTHING on the save hides the evidence: both requests answer PAID.",
+  "rule": "Don't check the key, claim it. One INSERT … ON CONFLICT DO NOTHING before the charge: whoever inserts the row charges, everyone else reads it. A retry that finds it pending gets PROCESSING, not a second charge.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/payments/02-idempotency-race",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "priya",
+      "label": "Priya",
+      "kind": "client"
+    },
+    {
+      "id": "rahul",
+      "label": "Rahul",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    },
+    {
+      "id": "bank",
+      "label": "Payment processor",
+      "kind": "external"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "SELECT the key, charge, then save",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\nexport type PayRequest = { orderId: string; amount: number; idempotencyKey: string };\n\n/**\n * BUG: the idempotency key is checked, then saved after the charge.\n * One request at a time it works: a retry finds the saved key and gets PAID back.\n * But a retry that arrives while the first request is still at the bank\n * finds nothing either. Both pass the check, both charge.\n */\nexport async function pay(ctx: Ctx, req: PayRequest) {\n  // step: check\n  const seen = await ctx.db.query(\"SELECT charge_id FROM payments WHERE idempotency_key = $1\", [req.idempotencyKey]);\n  if (seen.rows.length > 0) {\n    return ctx.respond(`PAID ${seen.rows[0].charge_id}`); // a retry: answer from what's stored\n  }\n\n  // step: charge\n  const charge = await ctx.bank.charge(req.orderId, req.amount);\n\n  // step: save\n  await ctx.db.query(\n    `INSERT INTO payments (idempotency_key, order_id, amount, status, charge_id)\n     VALUES ($1, $2, $3, 'succeeded', $4)\n     ON CONFLICT (idempotency_key) DO NOTHING`, // a retry beat us to it? fine, don't error\n    [req.idempotencyKey, req.orderId, req.amount, charge.id],\n  );\n\n  // step: respond\n  return ctx.respond(`PAID ${charge.id}`);\n}\n",
+      "steps": {
+        "check": [
+          12,
+          16
+        ],
+        "charge": [
+          18,
+          19
+        ],
+        "save": [
+          21,
+          27
+        ],
+        "respond": [
+          29,
+          30
+        ]
+      },
+      "initialState": {
+        "payments": [],
+        "bank": [],
+        "bank_calls": [
+          {
+            "calls": 0
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 10.8,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /pay { order-priya, ₹2000 } Idempotency-Key: key-priya"
+        },
+        {
+          "t": 10.8,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /pay { order-rahul, ₹2000 } Idempotency-Key: key-rahul"
+        },
+        {
+          "t": 13.6,
+          "actor": "priya",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT payments → 0 rows",
+          "detail": "SELECT charge_id FROM payments WHERE idempotency_key = $1",
+          "step": "check"
+        },
+        {
+          "t": 13.8,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 14,
+          "actor": "rahul",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT payments → 0 rows",
+          "detail": "SELECT charge_id FROM payments WHERE idempotency_key = $1",
+          "step": "check"
+        },
+        {
+          "t": 14,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-rahul…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 21.2,
+          "actor": "priya",
+          "type": "wait",
+          "label": "no answer yet → app retries with the same key",
+          "severity": "warn"
+        },
+        {
+          "t": 21.2,
+          "actor": "priya",
+          "type": "request",
+          "label": "retry: POST /pay { order-priya, ₹2000 } Idempotency-Key: key-priya"
+        },
+        {
+          "t": 21.7,
+          "actor": "priya",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT payments → 0 rows",
+          "detail": "SELECT charge_id FROM payments WHERE idempotency_key = $1",
+          "step": "check"
+        },
+        {
+          "t": 21.8,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 74.2,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_001",
+          "step": "charge"
+        },
+        {
+          "t": 75.3,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_002",
+          "step": "charge"
+        },
+        {
+          "t": 76,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status, charge_id) VALUES ($1, $2, $3, 'succeeded', $4) ON CONFLICT (idempotency_key) DO NOTHING",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "succeeded",
+                "charge_id": "ch_001"
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ],
+            "bank_calls": [
+              {
+                "calls": 2
+              }
+            ]
+          },
+          "step": "save"
+        },
+        {
+          "t": 77,
+          "actor": "priya",
+          "type": "response",
+          "label": "PAID ch_001",
+          "severity": "ok",
+          "step": "check"
+        },
+        {
+          "t": 77.1,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status, charge_id) VALUES ($1, $2, $3, 'succeeded', $4) ON CONFLICT (idempotency_key) DO NOTHING",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "succeeded",
+                "charge_id": "ch_001"
+              },
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "succeeded",
+                "charge_id": "ch_002"
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ],
+            "bank_calls": [
+              {
+                "calls": 2
+              }
+            ]
+          },
+          "step": "save"
+        },
+        {
+          "t": 78,
+          "actor": "rahul",
+          "type": "response",
+          "label": "PAID ch_002",
+          "severity": "ok",
+          "step": "check"
+        },
+        {
+          "t": 82.2,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_003",
+          "severity": "bad",
+          "step": "charge"
+        },
+        {
+          "t": 82.7,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 0 rows changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status, charge_id) VALUES ($1, $2, $3, 'succeeded', $4) ON CONFLICT (idempotency_key) DO NOTHING",
+          "severity": "warn",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "succeeded",
+                "charge_id": "ch_001"
+              },
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "succeeded",
+                "charge_id": "ch_002"
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-priya",
+                "charges": 2,
+                "charged_rs": 4000
+              },
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ],
+            "bank_calls": [
+              {
+                "calls": 3
+              }
+            ]
+          },
+          "step": "save"
+        },
+        {
+          "t": 83.1,
+          "actor": "priya",
+          "type": "response",
+          "label": "PAID ch_003",
+          "severity": "ok",
+          "step": "check"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "1 of 2 apps retried while the first request was still at the bank. All passed the key check: 1 charged twice, ₹2,000 extra, every one told PAID."
+      }
+    },
+    "fix": {
+      "label": "Claim the key first, in one INSERT",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\nimport type { PayRequest } from \"./bug.ts\";\n\n/**\n * FIX: claim the key before the charge, in one statement.\n * The unique index lets exactly one request insert the row. A retry that arrives\n * while the first is still at the bank finds the row 'pending' and gets PROCESSING:\n * the app polls, it doesn't charge.\n */\nexport async function pay(ctx: Ctx, req: PayRequest) {\n  // step: claim\n  const claimed = await ctx.db.query(\n    `INSERT INTO payments (idempotency_key, order_id, amount, status)\n     VALUES ($1, $2, $3, 'pending')\n     ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,\n    [req.idempotencyKey, req.orderId, req.amount],\n  );\n\n  // step: replay\n  if (claimed.rowCount === 0) {\n    const { rows } = await ctx.db.query(\"SELECT status, charge_id FROM payments WHERE idempotency_key = $1\", [req.idempotencyKey]);\n    return ctx.respond(rows[0].status === \"succeeded\" ? `PAID ${rows[0].charge_id}` : \"PROCESSING\");\n  }\n\n  // step: charge\n  const charge = await ctx.bank.charge(req.orderId, req.amount, req.idempotencyKey);\n\n  // step: record\n  await ctx.db.query(\"UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1\", [req.idempotencyKey, charge.id]);\n\n  // step: respond\n  return ctx.respond(`PAID ${charge.id}`);\n}\n",
+      "steps": {
+        "claim": [
+          11,
+          17
+        ],
+        "replay": [
+          19,
+          23
+        ],
+        "charge": [
+          25,
+          26
+        ],
+        "record": [
+          28,
+          29
+        ],
+        "respond": [
+          31,
+          32
+        ]
+      },
+      "initialState": {
+        "payments": [],
+        "bank": [],
+        "bank_calls": [
+          {
+            "calls": 0
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 9.4,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /pay { order-priya, ₹2000 } Idempotency-Key: key-priya"
+        },
+        {
+          "t": 9.4,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /pay { order-rahul, ₹2000 } Idempotency-Key: key-rahul"
+        },
+        {
+          "t": 11.5,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "pending",
+                "charge_id": null
+              },
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "pending",
+                "charge_id": null
+              }
+            ],
+            "bank": [],
+            "bank_calls": [
+              {
+                "calls": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 11.8,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "pending",
+                "charge_id": null
+              },
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "pending",
+                "charge_id": null
+              }
+            ],
+            "bank": [],
+            "bank_calls": [
+              {
+                "calls": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 12.5,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya (key key-priya)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 12.7,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-rahul (key key-rahul)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 19.8,
+          "actor": "priya",
+          "type": "wait",
+          "label": "no answer yet → app retries with the same key",
+          "severity": "warn"
+        },
+        {
+          "t": 19.9,
+          "actor": "priya",
+          "type": "request",
+          "label": "retry: POST /pay { order-priya, ₹2000 } Idempotency-Key: key-priya"
+        },
+        {
+          "t": 20.5,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 0 rows changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "severity": "warn",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "pending",
+                "charge_id": null
+              },
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "pending",
+                "charge_id": null
+              }
+            ],
+            "bank": [],
+            "bank_calls": [
+              {
+                "calls": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 21.6,
+          "actor": "priya",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT payments → status = 'pending', charge_id = null",
+          "detail": "SELECT status, charge_id FROM payments WHERE idempotency_key = $1",
+          "step": "replay"
+        },
+        {
+          "t": 21.7,
+          "actor": "priya",
+          "type": "response",
+          "label": "PROCESSING",
+          "severity": "warn",
+          "step": "replay"
+        },
+        {
+          "t": 73.1,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_001",
+          "step": "charge"
+        },
+        {
+          "t": 73.4,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_002",
+          "step": "charge"
+        },
+        {
+          "t": 74.6,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "succeeded",
+                "charge_id": "ch_002"
+              },
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "succeeded",
+                "charge_id": "ch_001"
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ],
+            "bank_calls": [
+              {
+                "calls": 2
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 74.8,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "payments": [
+              {
+                "idempotency_key": "key-rahul",
+                "order_id": "order-rahul",
+                "status": "succeeded",
+                "charge_id": "ch_002"
+              },
+              {
+                "idempotency_key": "key-priya",
+                "order_id": "order-priya",
+                "status": "succeeded",
+                "charge_id": "ch_001"
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ],
+            "bank_calls": [
+              {
+                "calls": 2
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 75,
+          "actor": "priya",
+          "type": "response",
+          "label": "PAID ch_001",
+          "severity": "ok",
+          "step": "replay"
+        },
+        {
+          "t": 75.1,
+          "actor": "rahul",
+          "type": "response",
+          "label": "PAID ch_002",
+          "severity": "ok",
+          "step": "replay"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "1 of 2 apps retried mid-charge. Each retry found the key claimed and got PROCESSING. Every customer charged once: ₹4,000."
+      }
+    }
+  },
+  "generatedAt": "2026-11-15T09:29:31.159Z"
+}

@@ -8,12 +8,15 @@ export type Charge = { id: string; orderId: string; amount: number; idempotencyK
 
 export class FakeBank {
   readonly charges: Charge[] = [];
+  /** every charge request that reached the bank, including ones a key turned into a replay */
+  calls = 0;
   private readonly byKey = new Map<string, Charge>();
 
   /** `latencyMs`: how long a charge takes, long enough that requests overlap. */
   constructor(readonly latencyMs = 20) {}
 
   charge(orderId: string, amount: number, idempotencyKey?: string): Charge {
+    this.calls++;
     const seen = idempotencyKey ? this.byKey.get(idempotencyKey) : undefined;
     if (seen) return seen;
     const charge: Charge = { id: `ch_${String(this.charges.length + 1).padStart(3, "0")}`, orderId, amount, idempotencyKey };
