@@ -20,6 +20,9 @@
     "limiter:bug": "tsx systems/rate-limiter/run.ts bug",
     "limiter:fix": "tsx systems/rate-limiter/run.ts fix",
     "limiter:all": "tsx systems/rate-limiter/run.ts all",
+    "payments:bug": "tsx systems/payments/run.ts bug",
+    "payments:fix": "tsx systems/payments/run.ts fix",
+    "payments:all": "tsx systems/payments/run.ts all",
     "trace": "tsx shared/build-traces.ts",
     "test": "tsx --test --test-concurrency=1 \"*/proof.test.ts\" \"systems/*/*/proof.test.ts\"",
     "typecheck": "tsc --noEmit"

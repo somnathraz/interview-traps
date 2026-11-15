@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { sleep } from "./db.ts";
+import { FakeBank } from "./bank.ts";
 import { FakeRedis } from "./kv.ts";
 import type { Severity } from "./trace-schema.ts";
 import type { Tracer } from "./tracer.ts";
@@ -41,6 +42,11 @@ export interface Ctx {
   /** Current time in ms. Episodes can pin it (window-boundary traps need exact timestamps). */
   now(): number;
   chargePayment(userId: string): Promise<void>;
+  /** Payment processor with a ledger (shared/bank.ts). Pass the same FakeBank to every ctx in a run. */
+  bank: {
+    /** Charge `amount` (in paise) for an order. With an idempotency key, a repeat returns the first charge. */
+    charge(orderId: string, amount: number, idempotencyKey?: string): Promise<{ id: string }>;
+  };
   respond<S extends string>(status: S): S;
 }
 
@@ -70,6 +76,8 @@ export interface CtxOptions {
    * fast (as if the client's short command timeout fired) and throws RedisUnavailable.
    */
   redisDown?: boolean;
+  /** the run's payment processor (ctx.bank). One FakeBank per run, shared by every request. */
+  bank?: FakeBank;
 }
 
 const compact = (sql: string) => sql.replace(/\s+/g, " ").trim();
@@ -213,6 +221,7 @@ export function makeCtx({
   memoryTarget = "memory",
   crashAfterCalls,
   redisDown,
+  bank = new FakeBank(),
 }: CtxOptions): Ctx {
   const calls = { n: 0, crashAfter: crashAfterCalls, down: redisDown };
   const redisClient = kvClient(redis, tracer, actor, "redis", "ctx.redis", calls);
@@ -270,6 +279,32 @@ export function makeCtx({
         anchor: "ctx.chargePayment",
       });
       await sleep(paymentMs);
+    },
+
+    bank: {
+      async charge(orderId, amount, idempotencyKey) {
+        await tracer.event({
+          actor,
+          target: "bank",
+          type: "wait",
+          label: `charge ₹${amount / 100} for ${orderId}${idempotencyKey ? ` (key ${idempotencyKey})` : ""}…`,
+          detail: "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          anchor: "ctx.bank.charge",
+        });
+        await sleep(bank.latencyMs);
+        const before = bank.charges.length;
+        const charge = bank.charge(orderId, amount, idempotencyKey);
+        const fresh = bank.charges.length > before;
+        await tracer.event({
+          actor,
+          target: "bank",
+          type: "write",
+          label: fresh ? `bank charged ₹${amount / 100} → ${charge.id}` : `same key: bank returned the existing charge ${charge.id}`,
+          anchor: "ctx.bank.charge",
+          severity: fresh && bank.totals().get(orderId)!.charges > 1 ? "bad" : undefined,
+        });
+        return { id: charge.id };
+      },
     },
 
     respond(status) {

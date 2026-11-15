@@ -28,11 +28,11 @@ Airbnb reports "five nines in consistency" for payments with this design while p
 | Day | Topic | Trap | Status |
 |---|---|---|---|
 | 1 | Core design | Idempotency keys and Orpheus's three phases | [design notes](./00-core-design) |
-| 2 | The double charge on retry | No idempotency key: the client times out, retries, the customer pays twice | coming |
+| 2 | The double charge on retry | No idempotency key: the response is lost, the app retries, the customer pays twice | [trap](./01-double-charge) · `npm run payments:bug -- double-charge` |
 | 3 | The idempotency race | Check the key, then charge: two retries at the same moment both find nothing | coming |
 | 4 | The charge inside the transaction | Network call inside a DB transaction: the charge succeeds, the commit fails, no record of the money | coming |
 | 5 | Timeout is not failure | A timed-out charge marked "failed": the customer retries, the first charge had gone through | coming |
 | 6 | The replica that didn't know | The key is read from a lagging replica: the retry looks new and charges again | coming |
 | 7 | Rollup | The whole design, every fix | — |
 
-Traps land with each day's reel and follow the same contract as the rest of the repo (see [`../../CLAUDE.md`](../../CLAUDE.md)).
+Run any day with `npm run payments:bug -- <day>` / `payments:fix`, or every trap at once with `npm run payments:all`. Traps land with each day's reel and follow the same contract as the rest of the repo (see [`../../CLAUDE.md`](../../CLAUDE.md)).
