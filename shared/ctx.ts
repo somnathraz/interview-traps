@@ -10,7 +10,11 @@ import type { Tracer } from "./tracer.ts";
  * so the code you read in bug.ts / fix.ts has zero tracing noise in it.
  */
 export interface Ctx {
-  db: { query<R extends pg.QueryResultRow = any>(sql: string, params?: unknown[]): Promise<pg.QueryResult<R>> };
+  db: {
+    query<R extends pg.QueryResultRow = any>(sql: string, params?: unknown[]): Promise<pg.QueryResult<R>>;
+    /** BEGIN … COMMIT on one connection. Throws (after ROLLBACK) if anything inside throws or the commit fails. */
+    transaction<T>(fn: (tx: { query<R extends pg.QueryResultRow = any>(sql: string, params?: unknown[]): Promise<pg.QueryResult<R>> }) => Promise<T>): Promise<T>;
+  };
   /** Redis-shaped cache. Backed by FakeRedis (shared/kv.ts) so traps need only Postgres. */
   redis: {
     get(key: string): Promise<string | null>;
@@ -76,6 +80,11 @@ export interface CtxOptions {
    * fast (as if the client's short command timeout fired) and throws RedisUnavailable.
    */
   redisDown?: boolean;
+  /**
+   * Postgres idle_in_transaction_session_timeout for ctx.db.transaction: a transaction left open
+   * with no statement running for longer than this is killed by the server (and rolled back).
+   */
+  idleInTransactionTimeoutMs?: number;
   /** the run's payment processor (ctx.bank). One FakeBank per run, shared by every request. */
   bank?: FakeBank;
 }
@@ -222,48 +231,72 @@ export function makeCtx({
   crashAfterCalls,
   redisDown,
   bank = new FakeBank(),
+  idleInTransactionTimeoutMs,
 }: CtxOptions): Ctx {
   const calls = { n: 0, crashAfter: crashAfterCalls, down: redisDown };
   const redisClient = kvClient(redis, tracer, actor, "redis", "ctx.redis", calls);
   // a server's own process memory: only that server can see it
   const memoryClient = kvClient(memory ?? new FakeRedis(), tracer, actor, memoryTarget, "ctx.memory");
 
+  const tracedQuery = async (run: (sql: string, params: unknown[]) => Promise<pg.QueryResult>, sql: string, params: unknown[]) => {
+    const verb = compact(sql).split(" ")[0].toUpperCase();
+    const isRead = verb === "SELECT";
+    const table = /(?:FROM|UPDATE|INTO)\s+(\w+)/i.exec(sql)?.[1] ?? /nextval\('(\w+)'\)/i.exec(sql)?.[1] ?? "db";
+    let res: pg.QueryResult;
+    try {
+      res = await run(sql, params);
+    } catch (err) {
+      // a failed statement is part of the story (timeouts, conflicts): trace it, then rethrow
+      const message = err instanceof Error ? err.message : String(err);
+      await tracer.event(
+        { actor, target: "db", type: isRead ? "read" : "write", label: `${verb} ${table} → ERROR: ${message}`, detail: compact(sql), anchor: sql, severity: "bad" },
+        { snapshot: !isRead },
+      );
+      throw err;
+    }
+    const result = isRead ? summarizeRows(res.rows) : verb === "COMMIT" ? "committed" : `${res.rowCount} row${res.rowCount === 1 ? "" : "s"} changed`;
+    await tracer.event(
+      {
+        actor,
+        target: "db",
+        type: isRead ? "read" : "write",
+        label: verb === "COMMIT" ? "COMMIT → committed" : `${verb} ${table} → ${result}`,
+        detail: compact(sql),
+        anchor: sql,
+        severity: !isRead && verb !== "COMMIT" && res.rowCount === 0 ? "warn" : undefined,
+      },
+      { snapshot: !isRead },
+    );
+    return res;
+  };
+
   return {
     redis: redisClient,
     memory: memoryClient,
 
     db: {
-      async query(sql, params = []) {
-        const verb = compact(sql).split(" ")[0].toUpperCase();
-        const isRead = verb === "SELECT";
-        const table =
-          /(?:FROM|UPDATE|INTO)\s+(\w+)/i.exec(sql)?.[1] ?? /nextval\('(\w+)'\)/i.exec(sql)?.[1] ?? "db";
-        let res: pg.QueryResult;
+      query: (sql, params = []) => tracedQuery((q, p) => pool.query(q, p), sql, params),
+
+      async transaction(fn) {
+        const client = await pool.connect();
+        client.on("error", () => {}); // a server-side kill arrives as an 'error' event; the next query reports it
+        const tx = { query: (sql: string, params: unknown[] = []) => tracedQuery((q, p) => client.query(q, p), sql, params) };
+        let broken: unknown;
         try {
-          res = await pool.query(sql, params);
+          await client.query("BEGIN");
+          if (idleInTransactionTimeoutMs) await client.query(`SET LOCAL idle_in_transaction_session_timeout = ${Number(idleInTransactionTimeoutMs)}`);
+          await tracer.event({ actor, target: "db", type: "write", label: "BEGIN transaction", anchor: "ctx.db.transaction" });
+          const out = await fn(tx);
+          await tx.query("COMMIT");
+          return out;
         } catch (err) {
-          // a failed statement is part of the story (timeouts, conflicts): trace it, then rethrow
-          const message = err instanceof Error ? err.message : String(err);
-          await tracer.event(
-            { actor, target: "db", type: isRead ? "read" : "write", label: `${verb} ${table} → ERROR: ${message}`, detail: compact(sql), anchor: sql, severity: "bad" },
-            { snapshot: !isRead },
-          );
+          broken = err;
+          await client.query("ROLLBACK").catch(() => {});
+          await tracer.event({ actor, target: "db", type: "write", label: "ROLLBACK: every write in this transaction is undone", anchor: "ctx.db.transaction", severity: "bad" }, { snapshot: true });
           throw err;
+        } finally {
+          client.release(broken instanceof Error && /terminat|Connection/i.test(broken.message) ? broken : undefined);
         }
-        const result = isRead ? summarizeRows(res.rows) : `${res.rowCount} row${res.rowCount === 1 ? "" : "s"} changed`;
-        await tracer.event(
-          {
-            actor,
-            target: "db",
-            type: isRead ? "read" : "write",
-            label: `${verb} ${table} → ${result}`,
-            detail: compact(sql),
-            anchor: sql,
-            severity: !isRead && res.rowCount === 0 ? "warn" : undefined,
-          },
-          { snapshot: !isRead },
-        );
-        return res;
       },
     },
 
@@ -291,7 +324,7 @@ export function makeCtx({
           detail: "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
           anchor: "ctx.bank.charge",
         });
-        await sleep(bank.latencyMs);
+        await sleep(bank.latencyFor(orderId));
         const before = bank.charges.length;
         const charge = bank.charge(orderId, amount, idempotencyKey);
         const fresh = bank.charges.length > before;

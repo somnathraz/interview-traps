@@ -1,0 +1,884 @@
+{
+  "schemaVersion": 1,
+  "slug": "payments-charge-in-transaction",
+  "number": 4,
+  "title": "The charge inside the transaction",
+  "question": "To make payment atomic, you wrap it in one database transaction: save the payment, charge the card, mark the order paid. The bank is slow and the transaction dies while waiting. What's left?",
+  "why": "A transaction can only undo database writes. The bank call inside it isn't one of them. When the transaction dies mid-wait, Postgres rolls back the payment row and the order, and the money stays with the bank: a charge with no record. The customer sees 'failed', pays again, and is charged twice.",
+  "rule": "Never call the network inside a database transaction. Claim the key and commit, call the bank with nothing open, then record the result in a short transaction. That's Airbnb's pre-RPC / RPC / post-RPC split.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/systems/payments/03-charge-in-transaction",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "priya",
+      "label": "Priya",
+      "kind": "client"
+    },
+    {
+      "id": "rahul",
+      "label": "Rahul",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    },
+    {
+      "id": "bank",
+      "label": "Payment processor",
+      "kind": "external"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "One transaction around the bank call",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\n\nexport type PayRequest = { orderId: string; amount: number; idempotencyKey: string };\n\n/**\n * BUG: \"make it atomic\" by wrapping the whole payment in one transaction,\n * bank call included. The transaction stays open while we wait on the bank.\n * If it dies in that wait (a timeout, a failover, a dropped connection), Postgres\n * rolls back the payment row and the order update. The bank's charge stays.\n */\nexport async function pay(ctx: Ctx, req: PayRequest) {\n  return ctx.db.transaction(async (tx) => {\n    // step: claim\n    const claimed = await tx.query(\n      `INSERT INTO payments (idempotency_key, order_id, amount, status)\n       VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,\n      [req.idempotencyKey, req.orderId, req.amount],\n    );\n    if (claimed.rowCount === 0) return ctx.respond(\"PROCESSING\");\n\n    // step: charge\n    const charge = await ctx.bank.charge(req.orderId, req.amount, req.idempotencyKey); // transaction still open\n\n    // step: record\n    await tx.query(\"UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1\", [req.idempotencyKey, charge.id]);\n    await tx.query(\"UPDATE orders SET status = 'paid' WHERE id = $1\", [req.orderId]);\n    return ctx.respond(`PAID ${charge.id}`);\n  });\n}\n",
+      "steps": {
+        "claim": [
+          13,
+          19
+        ],
+        "charge": [
+          21,
+          22
+        ],
+        "record": [
+          24,
+          28
+        ]
+      },
+      "initialState": {
+        "orders": [],
+        "bank": []
+      },
+      "events": [
+        {
+          "t": 8.1,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /pay { order-priya, ₹2000 } key key-priya-1"
+        },
+        {
+          "t": 8.1,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /pay { order-rahul, ₹2000 } key key-rahul-1"
+        },
+        {
+          "t": 9.1,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "BEGIN transaction"
+        },
+        {
+          "t": 9.7,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "BEGIN transaction"
+        },
+        {
+          "t": 11.1,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 0
+              }
+            ],
+            "bank": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 11.7,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 0
+              }
+            ],
+            "bank": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 18.1,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-rahul (key key-rahul-1)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 21.2,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya (key key-priya-1)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 37.7,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_001",
+          "step": "charge"
+        },
+        {
+          "t": 45.3,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 0
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 46.4,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE orders → 1 row changed",
+          "detail": "UPDATE orders SET status = 'paid' WHERE id = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 0
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 47,
+          "actor": "rahul",
+          "type": "response",
+          "label": "PAID ch_001",
+          "severity": "ok",
+          "step": "claim"
+        },
+        {
+          "t": 47.7,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "COMMIT → committed",
+          "detail": "COMMIT",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          }
+        },
+        {
+          "t": 421.7,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_002",
+          "step": "charge"
+        },
+        {
+          "t": 422.1,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → ERROR: Client has encountered a connection error and is not queryable",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "severity": "bad",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 423.5,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "ROLLBACK: every write in this transaction is undone",
+          "severity": "bad",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          }
+        },
+        {
+          "t": 424.3,
+          "actor": "priya",
+          "type": "response",
+          "label": "500: \"Payment failed, please try again\"",
+          "severity": "bad"
+        },
+        {
+          "t": 424.3,
+          "actor": "priya",
+          "type": "request",
+          "label": "try again: POST /pay { order-priya, ₹2000 } key key-priya-2"
+        },
+        {
+          "t": 424.7,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "BEGIN transaction"
+        },
+        {
+          "t": 425.3,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 425.8,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya (key key-priya-2)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 446,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_003",
+          "severity": "bad",
+          "step": "charge"
+        },
+        {
+          "t": 446.8,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 2,
+                "charged_rs": 4000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 447.8,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE orders → 1 row changed",
+          "detail": "UPDATE orders SET status = 'paid' WHERE id = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 0
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 2,
+                "charged_rs": 4000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 448.3,
+          "actor": "priya",
+          "type": "response",
+          "label": "PAID ch_003",
+          "severity": "ok",
+          "step": "claim"
+        },
+        {
+          "t": 449,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "COMMIT → committed",
+          "detail": "COMMIT",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "paid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 2,
+                "charged_rs": 4000
+              }
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "1 slow charge outlived the transaction: rolled back, money kept. 1 charge with no record, 1 customer charged twice after \"try again\": ₹2,000 extra."
+      }
+    },
+    "fix": {
+      "label": "Claim, charge, record: nothing open during the call",
+      "source": "import type { Ctx } from \"../../../shared/ctx.ts\";\nimport type { PayRequest } from \"./bug.ts\";\n\n/**\n * FIX: Airbnb's three phases. No network call inside a transaction,\n * no transaction open across a network call.\n * 1. claim the key (one statement, committed at once)\n * 2. call the bank with nothing open\n * 3. record the result in a short transaction: two UPDATEs, no waiting\n */\nexport async function pay(ctx: Ctx, req: PayRequest) {\n  // step: claim\n  const claimed = await ctx.db.query(\n    `INSERT INTO payments (idempotency_key, order_id, amount, status)\n     VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,\n    [req.idempotencyKey, req.orderId, req.amount],\n  );\n  if (claimed.rowCount === 0) return ctx.respond(\"PROCESSING\");\n\n  // step: charge\n  const charge = await ctx.bank.charge(req.orderId, req.amount, req.idempotencyKey); // nothing open while we wait\n\n  // step: record\n  await ctx.db.transaction(async (tx) => {\n    await tx.query(\"UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1\", [req.idempotencyKey, charge.id]);\n    await tx.query(\"UPDATE orders SET status = 'paid' WHERE id = $1\", [req.orderId]);\n  });\n  return ctx.respond(`PAID ${charge.id}`);\n}\n",
+      "steps": {
+        "claim": [
+          12,
+          18
+        ],
+        "charge": [
+          20,
+          21
+        ],
+        "record": [
+          23,
+          28
+        ]
+      },
+      "initialState": {
+        "orders": [],
+        "bank": [
+          {
+            "order_id": "order-rahul",
+            "charges": 1,
+            "charged_rs": 2000
+          },
+          {
+            "order_id": "order-priya",
+            "charges": 2,
+            "charged_rs": 4000
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 6.1,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /pay { order-priya, ₹2000 } key key-priya-1"
+        },
+        {
+          "t": 6.1,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /pay { order-rahul, ₹2000 } key key-rahul-1"
+        },
+        {
+          "t": 8.1,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 8.8,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-rahul (key key-rahul-1)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 9,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT payments → 1 row changed",
+          "detail": "INSERT INTO payments (idempotency_key, order_id, amount, status) VALUES ($1, $2, $3, 'pending') ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": []
+          },
+          "step": "claim"
+        },
+        {
+          "t": 9.8,
+          "actor": "priya",
+          "target": "bank",
+          "type": "wait",
+          "label": "charge ₹2000 for order-priya (key key-priya-1)…",
+          "detail": "Network call to the payment processor. Real ones (Razorpay, Stripe) take 100ms+.",
+          "step": "charge"
+        },
+        {
+          "t": 29.1,
+          "actor": "rahul",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_001",
+          "step": "charge"
+        },
+        {
+          "t": 29.5,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "BEGIN transaction",
+          "step": "record"
+        },
+        {
+          "t": 30.1,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 30.7,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE orders → 1 row changed",
+          "detail": "UPDATE orders SET status = 'paid' WHERE id = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "unpaid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 31.6,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "COMMIT → committed",
+          "detail": "COMMIT",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          }
+        },
+        {
+          "t": 32,
+          "actor": "rahul",
+          "type": "response",
+          "label": "PAID ch_001",
+          "severity": "ok",
+          "step": "claim"
+        },
+        {
+          "t": 411,
+          "actor": "priya",
+          "target": "bank",
+          "type": "write",
+          "label": "bank charged ₹2000 → ch_002",
+          "step": "charge"
+        },
+        {
+          "t": 411.9,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "BEGIN transaction",
+          "step": "record"
+        },
+        {
+          "t": 412.5,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE payments → 1 row changed",
+          "detail": "UPDATE payments SET status = 'succeeded', charge_id = $2 WHERE idempotency_key = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 413.6,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE orders → 1 row changed",
+          "detail": "UPDATE orders SET status = 'paid' WHERE id = $1",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "unpaid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          },
+          "step": "record"
+        },
+        {
+          "t": 414.9,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "COMMIT → committed",
+          "detail": "COMMIT",
+          "state": {
+            "orders": [
+              {
+                "id": "order-priya",
+                "status": "paid",
+                "payment_rows": 1
+              },
+              {
+                "id": "order-rahul",
+                "status": "paid",
+                "payment_rows": 1
+              }
+            ],
+            "bank": [
+              {
+                "order_id": "order-rahul",
+                "charges": 1,
+                "charged_rs": 2000
+              },
+              {
+                "order_id": "order-priya",
+                "charges": 1,
+                "charged_rs": 2000
+              }
+            ]
+          }
+        },
+        {
+          "t": 415.4,
+          "actor": "priya",
+          "type": "response",
+          "label": "PAID ch_002",
+          "severity": "ok",
+          "step": "claim"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "1 slow charge, no transaction open while waiting. Every customer charged once, every charge recorded, 2 of 2 orders paid."
+      }
+    }
+  },
+  "generatedAt": "2026-11-16T11:59:31.054Z"
+}

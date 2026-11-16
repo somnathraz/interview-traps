@@ -12,8 +12,15 @@ export class FakeBank {
   calls = 0;
   private readonly byKey = new Map<string, Charge>();
 
-  /** `latencyMs`: how long a charge takes, long enough that requests overlap. */
-  constructor(readonly latencyMs = 20) {}
+  /**
+   * `latency`: how long a charge takes, in ms. A number, or a function of the order and how many
+   * times it was charged before (so the first attempt can be slow during a sale and a retry fast).
+   */
+  constructor(readonly latency: number | ((orderId: string, attempt: number) => number) = 20) {}
+
+  latencyFor(orderId: string) {
+    return typeof this.latency === "number" ? this.latency : this.latency(orderId, this.charges.filter((c) => c.orderId === orderId).length);
+  }
 
   charge(orderId: string, amount: number, idempotencyKey?: string): Charge {
     this.calls++;

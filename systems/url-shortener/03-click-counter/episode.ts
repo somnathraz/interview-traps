@@ -17,7 +17,7 @@ let redis = new FakeRedis();
 /** Count UPDATEs against `links`. Harness only: episode code never sees this. */
 function countWrites(ctx: Ctx, counter: { n: number }): Ctx {
   const query = ctx.db.query.bind(ctx.db);
-  return { ...ctx, db: { query: (sql, params) => (/^\s*UPDATE\s+links/i.test(sql) && counter.n++, query(sql, params)) } };
+  return { ...ctx, db: { ...ctx.db, query: (sql, params) => (/^\s*UPDATE\s+links/i.test(sql) && counter.n++, query(sql, params)) } };
 }
 
 export const episode: Episode = {
