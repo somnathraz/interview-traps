@@ -20,6 +20,7 @@ $ npm run 01:fix
 | 02 | Offset pagination skips & duplicates rows | coming | |
 | 03 | Cache stampede when a hot key expires | coming | |
 | 04 | Payment retries without idempotency keys | coming | |
+| 05 | [The coupon the AI wrote](./05-coupon-race) · check-then-act, AI edition | `npm run 05:bug` | [▶ watch](https://somanathkhadanga.com/labs/traps/coupon-race) |
 
 New episodes land with each reel on Instagram/YouTube.
 

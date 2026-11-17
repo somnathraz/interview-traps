@@ -1,0 +1,479 @@
+{
+  "schemaVersion": 1,
+  "slug": "coupon-race",
+  "number": 5,
+  "title": "The coupon the AI wrote",
+  "question": "You ask an AI for a coupon API: WELCOME500, ₹500 off, valid for the first 10 uses. It works in every test. Then the sale starts and 50 people apply it in the same second. How many get ₹500 off?",
+  "why": "The AI's code reads `used`, checks it against max_uses, then increments in a second statement. Under concurrency every request reads the same old count before anyone writes, so every request passes the check. The increment itself is atomic, so the counter ends up exact, and far past the limit.",
+  "rule": "A limit check and the write that consumes it must be one statement. UPDATE … SET used = used + 1 WHERE used < max_uses RETURNING …: zero rows back means the coupon is gone.",
+  "links": {
+    "repo": "https://github.com/somnathraz/interview-traps/tree/main/05-coupon-race",
+    "reel": null
+  },
+  "actors": [
+    {
+      "id": "priya",
+      "label": "Priya",
+      "kind": "client"
+    },
+    {
+      "id": "rahul",
+      "label": "Rahul",
+      "kind": "client"
+    },
+    {
+      "id": "aman",
+      "label": "Aman",
+      "kind": "client"
+    },
+    {
+      "id": "db",
+      "label": "Postgres",
+      "kind": "db"
+    }
+  ],
+  "variants": {
+    "bug": {
+      "label": "AI's version: SELECT, check, UPDATE",
+      "source": "import type { Ctx } from \"../shared/ctx.ts\";\n\n/**\n * BUG: the coupon API an AI assistant writes in ten seconds.\n * Prompt: \"Write an Express + Postgres endpoint to apply a coupon code.\n * Each coupon has max_uses. Reject it when it's used up.\"\n * Clean, readable, passes the happy-path test. Under a sale, every request reads\n * `used` before any of them writes it, so all of them pass the check.\n */\nexport async function applyCoupon(ctx: Ctx, code: string, userId: string) {\n  // step: check\n  const { rows } = await ctx.db.query(\"SELECT discount, max_uses, used FROM coupons WHERE code = $1\", [code]);\n  const coupon = rows[0];\n  if (!coupon) return ctx.respond(\"404 Invalid coupon\");\n  if (coupon.used >= coupon.max_uses) return ctx.respond(\"410 Coupon expired\");\n\n  // step: redeem\n  await ctx.db.query(\"UPDATE coupons SET used = used + 1 WHERE code = $1\", [code]);\n  await ctx.db.query(\"INSERT INTO redemptions (code, user_id) VALUES ($1, $2)\", [code, userId]);\n\n  // step: respond\n  return ctx.respond(`200 ₹${coupon.discount} off applied`);\n}\n",
+      "steps": {
+        "check": [
+          11,
+          15
+        ],
+        "redeem": [
+          17,
+          19
+        ],
+        "respond": [
+          21,
+          22
+        ]
+      },
+      "initialState": {
+        "coupons": [
+          {
+            "code": "WELCOME500",
+            "max_uses": 10,
+            "used": 0
+          }
+        ],
+        "redemptions": [
+          {
+            "redemptions": 0
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 12.2,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 12.2,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 12.2,
+          "actor": "aman",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 15.5,
+          "actor": "priya",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT coupons → discount = 500, max_uses = 1, used = 0",
+          "detail": "SELECT discount, max_uses, used FROM coupons WHERE code = $1",
+          "step": "check"
+        },
+        {
+          "t": 16.1,
+          "actor": "rahul",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT coupons → discount = 500, max_uses = 1, used = 0",
+          "detail": "SELECT discount, max_uses, used FROM coupons WHERE code = $1",
+          "step": "check"
+        },
+        {
+          "t": 16.5,
+          "actor": "aman",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT coupons → discount = 500, max_uses = 1, used = 0",
+          "detail": "SELECT discount, max_uses, used FROM coupons WHERE code = $1",
+          "step": "check"
+        },
+        {
+          "t": 18.3,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 1 row changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 2
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 18.6,
+          "actor": "aman",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 1 row changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 2
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 19.4,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 1 row changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 3
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 23.9,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT redemptions → 1 row changed",
+          "detail": "INSERT INTO redemptions (code, user_id) VALUES ($1, $2)",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 3
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 3
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 24.3,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT redemptions → 1 row changed",
+          "detail": "INSERT INTO redemptions (code, user_id) VALUES ($1, $2)",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 3
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 3
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 24.6,
+          "actor": "aman",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT redemptions → 1 row changed",
+          "detail": "INSERT INTO redemptions (code, user_id) VALUES ($1, $2)",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 3
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 3
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 25,
+          "actor": "priya",
+          "type": "response",
+          "label": "200 ₹500 off applied",
+          "severity": "ok",
+          "step": "check"
+        },
+        {
+          "t": 25.1,
+          "actor": "rahul",
+          "type": "response",
+          "label": "200 ₹500 off applied",
+          "severity": "ok",
+          "step": "check"
+        },
+        {
+          "t": 25.2,
+          "actor": "aman",
+          "type": "response",
+          "label": "200 ₹500 off applied",
+          "severity": "ok",
+          "step": "check"
+        }
+      ],
+      "outcome": {
+        "ok": false,
+        "headline": "A coupon valid 1 time was applied 3 times by 3 users: ₹1,000 of discount you never meant to give."
+      }
+    },
+    "fix": {
+      "label": "One conditional UPDATE",
+      "source": "import type { Ctx } from \"../shared/ctx.ts\";\n\n/**\n * FIX: the line the AI missed. Put the check inside the write.\n * One UPDATE both checks `used < max_uses` and increments. Postgres locks the row\n * for each UPDATE, so the 11th request re-reads used = 10 and matches nothing.\n */\nexport async function applyCoupon(ctx: Ctx, code: string, userId: string) {\n  // step: claim\n  const { rows } = await ctx.db.query(\n    \"UPDATE coupons SET used = used + 1 WHERE code = $1 AND used < max_uses RETURNING discount\",\n    [code],\n  );\n\n  // step: reject\n  if (rows.length === 0) {\n    const exists = await ctx.db.query(\"SELECT 1 FROM coupons WHERE code = $1\", [code]);\n    return ctx.respond(exists.rows.length ? \"410 Coupon expired\" : \"404 Invalid coupon\");\n  }\n\n  // step: redeem\n  await ctx.db.query(\"INSERT INTO redemptions (code, user_id) VALUES ($1, $2)\", [code, userId]);\n\n  // step: respond\n  return ctx.respond(`200 ₹${rows[0].discount} off applied`);\n}\n",
+      "steps": {
+        "claim": [
+          9,
+          13
+        ],
+        "reject": [
+          15,
+          19
+        ],
+        "redeem": [
+          21,
+          22
+        ],
+        "respond": [
+          24,
+          25
+        ]
+      },
+      "initialState": {
+        "coupons": [
+          {
+            "code": "WELCOME500",
+            "max_uses": 10,
+            "used": 0
+          }
+        ],
+        "redemptions": [
+          {
+            "redemptions": 0
+          }
+        ]
+      },
+      "events": [
+        {
+          "t": 16.4,
+          "actor": "priya",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 16.4,
+          "actor": "rahul",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 16.4,
+          "actor": "aman",
+          "type": "request",
+          "label": "POST /apply-coupon { code: \"WELCOME500\" }"
+        },
+        {
+          "t": 19.4,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 1 row changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1 AND used < max_uses RETURNING discount",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 1
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 20.2,
+          "actor": "rahul",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 0 rows changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1 AND used < max_uses RETURNING discount",
+          "severity": "warn",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 1
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 21.8,
+          "actor": "aman",
+          "target": "db",
+          "type": "write",
+          "label": "UPDATE coupons → 0 rows changed",
+          "detail": "UPDATE coupons SET used = used + 1 WHERE code = $1 AND used < max_uses RETURNING discount",
+          "severity": "warn",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 1
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 0
+              }
+            ]
+          },
+          "step": "claim"
+        },
+        {
+          "t": 22.2,
+          "actor": "rahul",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT coupons → ?column? = 1",
+          "detail": "SELECT 1 FROM coupons WHERE code = $1",
+          "step": "reject"
+        },
+        {
+          "t": 22.2,
+          "actor": "rahul",
+          "type": "response",
+          "label": "410 Coupon expired",
+          "severity": "warn",
+          "step": "reject"
+        },
+        {
+          "t": 23.1,
+          "actor": "aman",
+          "target": "db",
+          "type": "read",
+          "label": "SELECT coupons → ?column? = 1",
+          "detail": "SELECT 1 FROM coupons WHERE code = $1",
+          "step": "reject"
+        },
+        {
+          "t": 23.1,
+          "actor": "aman",
+          "type": "response",
+          "label": "410 Coupon expired",
+          "severity": "warn",
+          "step": "reject"
+        },
+        {
+          "t": 23.2,
+          "actor": "priya",
+          "target": "db",
+          "type": "write",
+          "label": "INSERT redemptions → 1 row changed",
+          "detail": "INSERT INTO redemptions (code, user_id) VALUES ($1, $2)",
+          "state": {
+            "coupons": [
+              {
+                "code": "WELCOME500",
+                "max_uses": 1,
+                "used": 1
+              }
+            ],
+            "redemptions": [
+              {
+                "redemptions": 1
+              }
+            ]
+          },
+          "step": "redeem"
+        },
+        {
+          "t": 23.8,
+          "actor": "priya",
+          "type": "response",
+          "label": "200 ₹500 off applied",
+          "severity": "ok",
+          "step": "reject"
+        }
+      ],
+      "outcome": {
+        "ok": true,
+        "headline": "3 users, 1 got ₹500 off, 2 told \"Coupon expired\". Exactly the limit."
+      }
+    }
+  },
+  "generatedAt": "2026-11-17T12:50:56.636Z"
+}
